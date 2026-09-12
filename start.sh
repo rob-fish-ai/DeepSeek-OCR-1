@@ -30,6 +30,20 @@ echo "============================================"
 
 cd "$(dirname "$0")"
 
+# Use the project virtualenv's interpreter if present. The system python3
+# has none of the dependencies, so a bare "python3 api_service.py" dies on
+# "ModuleNotFoundError: No module named 'fitz'" and the supervisor spins.
+# Override with PYTHON=/path/to/python if needed.
+PYTHON=${PYTHON:-}
+if [ -z "$PYTHON" ]; then
+    if [ -x "$(dirname "$0")/.venv/bin/python" ]; then
+        PYTHON="$(dirname "$0")/.venv/bin/python"
+    else
+        PYTHON=python3
+    fi
+fi
+echo "Python:   $PYTHON"
+
 # exec: replace bash with python so the supervisor's PID == python's PID.
 # Without this, killing the bash wrapper leaves the python child orphaned.
-exec python3 api_service.py
+exec "$PYTHON" api_service.py

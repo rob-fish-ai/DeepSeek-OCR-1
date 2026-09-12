@@ -9,12 +9,14 @@ are batched on the GPU automatically without semaphore serialization.
 import asyncio
 import base64
 import io
+import json
 import logging
 import os
 import re
 import sys
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -114,6 +116,7 @@ DEFAULT_PROMPT = "document"
 engine: Optional[AsyncLLMEngine] = None
 sampling_params: Optional[SamplingParams] = None
 processor: Optional[DeepseekOCRProcessor] = None
+worker_pool: Optional[ThreadPoolExecutor] = None
 
 
 # ---------------------------------------------------------------------------
@@ -256,10 +259,16 @@ def _save_feedback(image: Image.Image, result: dict, filename: str = None):
             "corrected_text": None,
             "status": "pending",
         }
+        # Write via a temp file + atomic rename.  A plain open("w") leaves a
+        # zero-byte file behind if the process is killed mid-write, which is
+        # how the unreadable entries in feedback/pending got there.
         meta_path = os.path.join(pending_dir, f"{entry_id}.json")
-        import json as _json
-        with open(meta_path, "w") as f:
-            _json.dump(meta, f, indent=2)
+        tmp_path = f"{meta_path}.tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(meta, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, meta_path)
 
         logger.info("Feedback saved: %s (score=%.3f, engine=%s)",
                     entry_id, score, result.get("ocr_engine"))
@@ -310,8 +319,11 @@ def load_image_from_bytes(data: bytes) -> Image.Image:
 def preprocess_image(image: Image.Image, prompt_key: str = DEFAULT_PROMPT) -> dict:
     """Preprocess a single image into vLLM input format."""
     prompt = PROMPTS.get(prompt_key, PROMPTS[DEFAULT_PROMPT])
+    # The prompt must be passed to tokenize_with_images: vLLM takes its prompt
+    # token ids from the features below and ignores the "prompt" string here,
+    # so tokenizing with the wrong prompt silently ignores prompt_key.
     features = processor.tokenize_with_images(
-        images=[image], bos=True, eos=True, cropping=CROP_MODE
+        images=[image], bos=True, eos=True, cropping=CROP_MODE, conversation=prompt
     )
     return {
         "prompt": prompt,
@@ -320,7 +332,7 @@ def preprocess_image(image: Image.Image, prompt_key: str = DEFAULT_PROMPT) -> di
 
 
 def pdf_to_images(pdf_bytes: bytes, dpi: int = 144) -> list[Image.Image]:
-    """Convert PDF bytes to a list of PIL Images."""
+    """Convert PDF bytes to a list of enhanced PIL Images (sequential; kept for compatibility)."""
     images = []
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
@@ -341,6 +353,68 @@ def pdf_to_images(pdf_bytes: bytes, dpi: int = 144) -> list[Image.Image]:
         images.append(img)
     doc.close()
     return images
+
+
+def _render_page_chunk(pdf_bytes: bytes, dpi: int, page_indices: list[int]):
+    """Render, pre-check, and enhance a chunk of pages. One fitz.Document per worker call.
+
+    Returns list of (page_idx, original_img, enhanced_img_or_none, skip_flag_or_none).
+    Skipped pages (blank / low-quality) have enhanced=None so we don't waste enhancement work.
+    """
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        zoom = dpi / 72.0
+        matrix = fitz.Matrix(zoom, zoom)
+        results = []
+        for idx in page_indices:
+            pix = doc[idx].get_pixmap(matrix=matrix, alpha=False)
+            img_data = pix.tobytes("png")
+            original = Image.open(io.BytesIO(img_data))
+            original.load()  # decode now while we're off the event loop
+
+            if is_blank_page(original):
+                results.append((idx, original, None, "blank_page"))
+            elif is_low_quality_scan(original):
+                results.append((idx, original, None, "low_quality_scan"))
+            else:
+                enhanced = enhance_scan(original).convert("RGB")
+                results.append((idx, original, enhanced, None))
+        return results
+    finally:
+        doc.close()
+
+
+async def render_pdf_parallel(pdf_bytes: bytes, dpi: int, num_pages: int):
+    """Render + enhance + pre-check all pages across the worker pool.
+
+    Returns (originals, enhanced_or_none, skip_flags) indexed by page number.
+    ``enhanced_or_none[i]`` is None for blank / low-quality pages.
+    """
+    loop = asyncio.get_event_loop()
+
+    # Round-robin partition so each worker gets pages spread across the document
+    # (avoids one worker getting all the heavy pages if they cluster).
+    n_workers = max(1, min(NUM_WORKERS, num_pages))
+    chunks: list[list[int]] = [[] for _ in range(n_workers)]
+    for i in range(num_pages):
+        chunks[i % n_workers].append(i)
+
+    tasks = [
+        loop.run_in_executor(None, _render_page_chunk, pdf_bytes, dpi, chunk)
+        for chunk in chunks
+        if chunk
+    ]
+    chunk_results = await asyncio.gather(*tasks)
+
+    originals: list[Optional[Image.Image]] = [None] * num_pages
+    enhanced: list[Optional[Image.Image]] = [None] * num_pages
+    skip_flags: list[Optional[str]] = [None] * num_pages
+    for chunk in chunk_results:
+        for idx, orig, enh, flag in chunk:
+            originals[idx] = orig
+            enhanced[idx] = enh
+            skip_flags[idx] = flag
+    return originals, enhanced, skip_flags
 
 
 async def _run_inference(image: Image.Image, prompt_key: str = DEFAULT_PROMPT) -> dict:
@@ -506,7 +580,12 @@ async def _run_inference_with_retry(
             preset_name=preset["name"],
             clean_stats=retry_stats,
         )
-        score_result(ocr_result, other_results=results, image_width=image.width, image_height=image.height)
+        # No image dimensions here: _score_content_density switches to a
+        # pixel-ratio scale when given them, which scores a normal page ~0.26
+        # instead of ~1.0.  _format_result scores without dimensions, and the
+        # two composites are compared against each other by the PDF and batch
+        # endpoints, so both paths must score on the same scale.
+        score_result(ocr_result, other_results=results)
         results.append(ocr_result)
 
         logger.info(
@@ -522,6 +601,14 @@ async def _run_inference_with_retry(
             break
 
     best = select_best_result(results)
+
+    # select_best_result ranks candidates using cross-run self-consistency,
+    # which a single first-pass result cannot have (it scores a flat 1.0).
+    # Re-score the winner on a single-run basis so the composite we report —
+    # and that the PDF/batch endpoints compare against the first pass — is
+    # computed exactly the way _format_result computes it.
+    score_result(best)
+
     flag_info = compute_flags(best, SCORE_THRESHOLD)
 
     result = {
@@ -605,7 +692,12 @@ def _check_file_size(data: bytes, max_mb: int, label: str = "File"):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup: load AsyncLLMEngine.  Shutdown: release resources."""
-    global engine, sampling_params, processor
+    global engine, sampling_params, processor, worker_pool
+
+    # Wire NUM_WORKERS to the event loop's default executor so run_in_executor(None, ...)
+    # calls use our configured pool instead of Python's default (min(32, cpu+4)).
+    worker_pool = ThreadPoolExecutor(max_workers=NUM_WORKERS, thread_name_prefix="ocr")
+    asyncio.get_event_loop().set_default_executor(worker_pool)
 
     # ---- Startup ----
     logger.info("Loading model from %s …", MODEL_PATH)
@@ -656,6 +748,8 @@ async def lifespan(app: FastAPI):
         engine.shutdown_background_loop()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    if worker_pool is not None:
+        worker_pool.shutdown(wait=True)
     logger.info("Cleanup complete.")
 
 
@@ -832,30 +926,29 @@ async def ocr_pdf(
     pdf_bytes = await file.read()
     _check_file_size(pdf_bytes, MAX_PDF_SIZE_MB, "PDF")
 
-    loop = asyncio.get_event_loop()
-    images = await loop.run_in_executor(None, pdf_to_images, pdf_bytes, dpi)
+    # Read page count once, before dispatching workers.
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    num_pages = len(doc)
+    doc.close()
 
-    if not images:
+    if num_pages == 0:
         raise HTTPException(400, "Could not extract any pages from the PDF")
+    if num_pages > MAX_PDF_PAGES:
+        raise HTTPException(
+            400, f"PDF has {num_pages} pages, maximum allowed is {MAX_PDF_PAGES}"
+        )
 
-    # Detect blank and low-quality pages before OCR
-    skip_flags = []  # None = process, str = reason to skip
-    for img in images:
-        if is_blank_page(img):
-            skip_flags.append("blank_page")
-        elif is_low_quality_scan(img):
-            skip_flags.append("low_quality_scan")
-        else:
-            skip_flags.append(None)
+    # Parallel render + enhance + blank/low-quality checks.
+    # ``originals`` are cached so the retry pass doesn't re-open the PDF.
+    originals, enhanced_images, skip_flags = await render_pdf_parallel(
+        pdf_bytes, dpi, num_pages
+    )
 
     skip_count = sum(1 for s in skip_flags if s is not None)
     if skip_count:
         logger.info("Skipping %d page(s) (blank or low-quality) — no OCR needed", skip_count)
 
-    # First pass: batch processable pages only
-    pages = [None] * len(images)
-
-    # Fill in skipped pages immediately
+    pages = [None] * num_pages
     skip_messages = {
         "blank_page": "Blank page detected — skipped OCR",
         "low_quality_scan": "Low-quality scan — content too small to read",
@@ -866,12 +959,12 @@ async def ocr_pdf(
             result["page"] = i + 1
             pages[i] = result
 
-    # Run OCR on processable pages concurrently
+    # First-pass OCR on processable pages, concurrently.
     processable_indices = [i for i, skip in enumerate(skip_flags) if skip is None]
     if processable_indices:
         async def _ocr_page(page_idx: int) -> tuple[int, dict]:
-            output = await _run_inference(images[page_idx], prompt)
-            result = await _format_result(output, raw, image=images[page_idx])
+            output = await _run_inference(enhanced_images[page_idx], prompt)
+            result = await _format_result(output, raw, image=enhanced_images[page_idx])
             result["page"] = page_idx + 1
             return page_idx, result
 
@@ -890,26 +983,34 @@ async def ocr_pdf(
         if result is not None and skip_flags[i] is None and retry and result["score"]["composite"] < SCORE_THRESHOLD:
             retry_indices.append(i)
 
-    # Retry low-scoring pages individually with different presets
-    for idx in retry_indices:
-        logger.info("Retrying page %d (score=%.3f < %.3f)", idx + 1, pages[idx]["score"]["composite"], SCORE_THRESHOLD)
-        # Get the original (un-enhanced) PDF page image
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        zoom = dpi / 72.0
-        matrix = fitz.Matrix(zoom, zoom)
-        pix = doc[idx].get_pixmap(matrix=matrix, alpha=False)
-        img_data = pix.tobytes("png")
-        original_img = Image.open(io.BytesIO(img_data))
-        doc.close()
+    # Retry low-scoring pages in parallel, reusing the cached originals.
+    if retry_indices:
+        logger.info("Retrying %d page(s) with low scores", len(retry_indices))
 
-        retry_result = await _run_inference_with_retry(original_img, prompt)
-        retry_result["page"] = idx + 1
-        if raw:
-            retry_result["text"] = retry_result["raw_text"]
+        async def _retry_page(page_idx: int) -> tuple[int, dict]:
+            logger.info(
+                "Retrying page %d (score=%.3f < %.3f)",
+                page_idx + 1,
+                pages[page_idx]["score"]["composite"],
+                SCORE_THRESHOLD,
+            )
+            result = await _run_inference_with_retry(originals[page_idx], prompt)
+            result["page"] = page_idx + 1
+            if raw:
+                result["text"] = result["raw_text"]
+            return page_idx, result
 
-        # Use retry result if it scored better
-        if retry_result.get("score", {}).get("composite", 0) > pages[idx]["score"]["composite"]:
-            pages[idx] = retry_result
+        retry_tasks = [_retry_page(idx) for idx in retry_indices]
+        retry_results = await asyncio.gather(*retry_tasks, return_exceptions=True)
+
+        for item in retry_results:
+            if isinstance(item, Exception):
+                logger.error("Retry OCR failed: %s", item)
+                continue
+            page_idx, retry_result = item
+            # Use retry result only if it scored better
+            if retry_result.get("score", {}).get("composite", 0) > pages[page_idx]["score"]["composite"]:
+                pages[page_idx] = retry_result
 
     # Fill any None pages (from failed OCR)
     for i, p in enumerate(pages):
@@ -1100,6 +1201,63 @@ async def ocr_batch(
 # ---------------------------------------------------------------------------
 
 
+# Entry ids are generated as "<YYYYmmdd>_<HHMMSS>_<12 hex chars>" by
+# _save_feedback. Anything else is rejected: entry_id is interpolated into a
+# filesystem path below, and without this an id like "../../etc/cron.d/evil"
+# would let an unauthenticated caller write, move and delete files anywhere
+# the service can reach.
+_ENTRY_ID_RE = re.compile(r"^\d{8}_\d{6}_[0-9a-f]{12}$")
+
+
+def _validate_entry_id(entry_id: str) -> str:
+    if not _ENTRY_ID_RE.match(entry_id):
+        raise HTTPException(400, "Invalid entry_id format")
+    return entry_id
+
+
+def _verify_feedback_entry(entry_id: str, corrected_text: str) -> dict:
+    """Move a pending entry into verified/ with the corrected text attached."""
+    pending_dir = os.path.join(FEEDBACK_DIR, "pending")
+    verified_dir = os.path.join(FEEDBACK_DIR, "verified")
+
+    meta_path = os.path.join(pending_dir, f"{entry_id}.json")
+    img_path = os.path.join(pending_dir, f"{entry_id}.png")
+
+    meta = _load_meta(pending_dir, f"{entry_id}.json")
+    if meta is None:
+        if os.path.exists(meta_path):
+            raise HTTPException(422, f"Feedback entry '{entry_id}' is unreadable")
+        raise HTTPException(404, f"Feedback entry '{entry_id}' not found")
+
+    meta["corrected_text"] = corrected_text
+    meta["status"] = "verified"
+
+    os.makedirs(verified_dir, exist_ok=True)
+    verified_meta = os.path.join(verified_dir, f"{entry_id}.json")
+    verified_img = os.path.join(verified_dir, f"{entry_id}.png")
+
+    tmp_path = f"{verified_meta}.tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(meta, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, verified_meta)
+
+    if os.path.exists(img_path):
+        os.replace(img_path, verified_img)
+    # Only drop the pending copy once the verified one is safely in place.
+    try:
+        os.remove(meta_path)
+    except FileNotFoundError:
+        pass
+
+    return {
+        "status": "verified",
+        "entry_id": entry_id,
+        "corrected_length": len(corrected_text),
+    }
+
+
 @app.post("/feedback/correct")
 async def feedback_correct(
     entry_id: str = Form(...),
@@ -1110,109 +1268,97 @@ async def feedback_correct(
     The downstream AI or human reviewer sends the correct text for a page
     that scored below threshold. These verified pairs are used for fine-tuning.
     """
-    import json as _json
-
-    pending_dir = os.path.join(FEEDBACK_DIR, "pending")
-    verified_dir = os.path.join(FEEDBACK_DIR, "verified")
-    os.makedirs(verified_dir, exist_ok=True)
-
-    meta_path = os.path.join(pending_dir, f"{entry_id}.json")
-    img_path = os.path.join(pending_dir, f"{entry_id}.png")
-
-    if not os.path.exists(meta_path):
-        raise HTTPException(404, f"Feedback entry '{entry_id}' not found")
-
-    with open(meta_path) as f:
-        meta = _json.load(f)
-
-    meta["corrected_text"] = corrected_text
-    meta["status"] = "verified"
-
-    # Move to verified directory
-    verified_meta = os.path.join(verified_dir, f"{entry_id}.json")
-    verified_img = os.path.join(verified_dir, f"{entry_id}.png")
-
-    with open(verified_meta, "w") as f:
-        _json.dump(meta, f, indent=2)
-
-    if os.path.exists(img_path):
-        os.rename(img_path, verified_img)
-    os.remove(meta_path)
-
+    _validate_entry_id(entry_id)
+    body = await asyncio.to_thread(_verify_feedback_entry, entry_id, corrected_text)
     logger.info("Feedback verified: %s (%d chars corrected text)", entry_id, len(corrected_text))
-
-    return JSONResponse({
-        "status": "verified",
-        "entry_id": entry_id,
-        "corrected_length": len(corrected_text),
-    })
+    return JSONResponse(body)
 
 
-@app.get("/feedback/stats")
-async def feedback_stats():
-    """Show feedback storage statistics."""
-    import json as _json
+# Cap on how many entries a single /feedback/pending call will read.
+FEEDBACK_PAGE_MAX = int(os.environ.get("FEEDBACK_PAGE_MAX", "500"))
 
+
+def _scan_feedback_dir(directory: str, with_size: bool = False) -> tuple[list[str], int]:
+    """Return (sorted .json names, total bytes) for a feedback directory.
+
+    Uses scandir so the optional size sweep reuses the directory entry's stat
+    instead of issuing a second stat() per file — this directory holds tens of
+    thousands of files on a network mount, where per-file stats dominate.
+    Pass ``with_size=False`` (the default) to skip them entirely.
+    """
+    if not os.path.isdir(directory):
+        return [], 0
+    names: list[str] = []
+    total_bytes = 0
+    with os.scandir(directory) as it:
+        for entry in it:
+            if with_size:
+                try:
+                    total_bytes += entry.stat().st_size
+                except OSError:
+                    continue
+            if entry.name.endswith(".json"):
+                names.append(entry.name)
+    names.sort()
+    return names, total_bytes
+
+
+def _load_meta(directory: str, name: str) -> Optional[dict]:
+    """Read one metadata file, returning None if it is missing or unreadable."""
+    try:
+        with open(os.path.join(directory, name)) as fp:
+            return json.load(fp)
+    except (OSError, ValueError):
+        return None
+
+
+def _collect_feedback_stats() -> dict:
     pending_dir = os.path.join(FEEDBACK_DIR, "pending")
     verified_dir = os.path.join(FEEDBACK_DIR, "verified")
 
-    pending = 0
-    verified = 0
-    engines = {}
+    pending_names, pending_bytes = _scan_feedback_dir(pending_dir, with_size=True)
+    verified_names, verified_bytes = _scan_feedback_dir(verified_dir, with_size=True)
 
-    for d, status in [(pending_dir, "pending"), (verified_dir, "verified")]:
-        if not os.path.isdir(d):
-            continue
-        for f in os.listdir(d):
-            if not f.endswith(".json"):
+    engines: dict = {}
+    unreadable = 0
+    for d, names in [(pending_dir, pending_names), (verified_dir, verified_names)]:
+        for name in names:
+            meta = _load_meta(d, name)
+            if meta is None:
+                unreadable += 1
                 continue
-            if status == "pending":
-                pending += 1
-            else:
-                verified += 1
-            try:
-                with open(os.path.join(d, f)) as fp:
-                    meta = _json.load(fp)
-                eng = meta.get("ocr_engine", "unknown")
-                engines[eng] = engines.get(eng, 0) + 1
-            except Exception:
-                pass
+            eng = meta.get("ocr_engine", "unknown")
+            engines[eng] = engines.get(eng, 0) + 1
 
-    # Estimate disk usage
-    total_bytes = 0
-    for d in [pending_dir, verified_dir]:
-        if os.path.isdir(d):
-            for f in os.listdir(d):
-                total_bytes += os.path.getsize(os.path.join(d, f))
-
-    return JSONResponse({
+    pending = len(pending_names)
+    verified = len(verified_names)
+    return {
         "pending": pending,
         "verified": verified,
         "total": pending + verified,
         "ready_for_training": verified >= 50,
         "engines": engines,
-        "disk_usage_mb": round(total_bytes / (1024 * 1024), 2),
-    })
+        "unreadable": unreadable,
+        "disk_usage_mb": round((pending_bytes + verified_bytes) / (1024 * 1024), 2),
+    }
 
 
-@app.get("/feedback/pending")
-async def feedback_pending():
-    """List pending feedback entries awaiting correction."""
-    import json as _json
-
+def _collect_pending(limit: int, offset: int) -> dict:
     pending_dir = os.path.join(FEEDBACK_DIR, "pending")
-    if not os.path.isdir(pending_dir):
-        return JSONResponse({"entries": []})
+    names, _ = _scan_feedback_dir(pending_dir)
 
     entries = []
-    for f in sorted(os.listdir(pending_dir)):
-        if not f.endswith(".json"):
+    unreadable = 0
+    # Only the requested slice is opened. Reading every entry took ~77 s
+    # against the current directory, which is far too long to hold a worker.
+    for name in names[offset:offset + limit]:
+        meta = _load_meta(pending_dir, name)
+        if meta is None:
+            unreadable += 1
             continue
-        with open(os.path.join(pending_dir, f)) as fp:
-            meta = _json.load(fp)
         entries.append({
-            "entry_id": meta["id"],
-            "timestamp": meta["timestamp"],
+            "entry_id": meta.get("id", name[:-len(".json")]),
+            "timestamp": meta.get("timestamp"),
             "filename": meta.get("filename"),
             "score": meta.get("score"),
             "flag": meta.get("flag"),
@@ -1220,7 +1366,34 @@ async def feedback_pending():
             "text_length": len(meta.get("text", "")),
         })
 
-    return JSONResponse({"entries": entries, "total": len(entries)})
+    return {
+        "entries": entries,
+        "total": len(names),
+        "returned": len(entries),
+        "limit": limit,
+        "offset": offset,
+        "unreadable": unreadable,
+    }
+
+
+@app.get("/feedback/stats")
+async def feedback_stats():
+    """Show feedback storage statistics."""
+    # Off the event loop: this walks every metadata file, and the loop it
+    # would otherwise block is the one driving the vLLM engine.
+    return JSONResponse(await asyncio.to_thread(_collect_feedback_stats))
+
+
+@app.get("/feedback/pending")
+async def feedback_pending(limit: int = FEEDBACK_PAGE_MAX, offset: int = 0):
+    """List pending feedback entries awaiting correction (oldest first).
+
+    Entries that cannot be read are skipped and counted in ``unreadable``
+    rather than failing the request.
+    """
+    limit = max(1, min(limit, FEEDBACK_PAGE_MAX))
+    offset = max(0, offset)
+    return JSONResponse(await asyncio.to_thread(_collect_pending, limit, offset))
 
 
 # ---------------------------------------------------------------------------
