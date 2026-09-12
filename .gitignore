@@ -9,3 +9,5 @@ build/
 feedback/
 # test corpus for test_all_images.py — real scanned pages, never commit
 images/
+.venv/
+venv/
