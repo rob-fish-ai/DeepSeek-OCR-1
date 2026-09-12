@@ -7,3 +7,5 @@ build/
 .env
 *.log
 feedback/
+# test corpus for test_all_images.py — real scanned pages, never commit
+images/
