@@ -619,6 +619,28 @@ Estimated ~5% of pages saved. Storage: ~210 KB per entry (image + JSON metadata)
 
 Disable with: `FEEDBACK_ENABLED=false`
 
+#### Retention
+
+Feedback storage was previously unbounded and reached 38,963 entries / 12.2 GB
+at roughly 111 MB/day. A background task now enforces a disk budget
+(`FEEDBACK_MAX_GB`, default 20) at startup and every `FEEDBACK_PRUNE_INTERVAL_S`,
+deleting the oldest pending entries until storage fits. Entry ids are
+timestamp-prefixed, so ordering by filename is chronological.
+
+`verified/` is never pruned — those entries carry human-corrected text and are
+the only ones with training value — but its size counts against the budget. If
+`verified/` alone exceeds the budget, pruning stops and logs a warning rather
+than deleting every pending entry trying to get under it.
+
+The default budget sits above current usage, so enabling it does not delete
+anything; lower it to reclaim space. `GET /feedback/stats` reports
+`disk_budget_gb` and `disk_used_pct`.
+
+Metadata is written via a temp file and `os.replace`. A plain `open("w")` left
+a zero-byte file behind whenever the process was killed mid-write, which is how
+41 unreadable entries and 104 zero-byte images accumulated before this was
+fixed.
+
 ---
 
 ## API Endpoints
@@ -717,6 +739,9 @@ All OCR endpoints return:
 | `FEEDBACK_DIR` | `./feedback` | Feedback storage path |
 | `FEEDBACK_ENABLED` | `true` | Enable feedback storage |
 | `FEEDBACK_SCORE_THRESHOLD` | `0.70` | Save results below this score |
+| `FEEDBACK_MAX_GB` | `20` | Disk budget; oldest pending entries pruned above it |
+| `FEEDBACK_PRUNE_INTERVAL_S` | `21600` | How often the budget is enforced |
+| `FEEDBACK_PAGE_MAX` | `500` | Max entries returned by `/feedback/pending` |
 
 ### Forced Environment
 

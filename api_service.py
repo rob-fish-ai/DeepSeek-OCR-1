@@ -97,6 +97,12 @@ MAX_RETRIES = int(os.environ.get("MAX_RETRIES", str(DEFAULT_MAX_RETRIES)))
 FEEDBACK_DIR = os.environ.get("FEEDBACK_DIR", os.path.join(os.path.dirname(__file__), "feedback"))
 FEEDBACK_ENABLED = os.environ.get("FEEDBACK_ENABLED", "true").lower() == "true"
 FEEDBACK_SCORE_THRESHOLD = float(os.environ.get("FEEDBACK_SCORE_THRESHOLD", "0.70"))
+# Disk budget for feedback storage. Oldest pending entries are pruned once the
+# directory exceeds this. The default sits above current usage (~12 GB) so
+# enabling it does not immediately delete archived pages; lower it to reclaim
+# space. Roughly 111 MB/day of growth at peak traffic.
+FEEDBACK_MAX_GB = float(os.environ.get("FEEDBACK_MAX_GB", "20"))
+FEEDBACK_PRUNE_INTERVAL_S = int(os.environ.get("FEEDBACK_PRUNE_INTERVAL_S", str(6 * 3600)))
 
 # ---------------------------------------------------------------------------
 # Prompt templates
@@ -755,12 +761,22 @@ async def lifespan(app: FastAPI):
 
     processor = DeepseekOCRProcessor()
 
+    # Enforce the feedback storage budget in the background. Runs off the
+    # event loop; the directory holds tens of thousands of files on a network
+    # mount, so scanning it inline would stall the vLLM engine.
+    prune_task = asyncio.create_task(_feedback_prune_loop())
+
     logger.info("Model loaded and ready (async engine).")
 
     yield  # ---- App runs here ----
 
     # ---- Shutdown ----
     logger.info("Shutting down …")
+    prune_task.cancel()
+    try:
+        await prune_task
+    except asyncio.CancelledError:
+        pass
     if engine:
         engine.shutdown_background_loop()
     if torch.cuda.is_available():
@@ -1349,6 +1365,7 @@ def _collect_feedback_stats() -> dict:
 
     pending = len(pending_names)
     verified = len(verified_names)
+    used = pending_bytes + verified_bytes
     return {
         "pending": pending,
         "verified": verified,
@@ -1356,7 +1373,9 @@ def _collect_feedback_stats() -> dict:
         "ready_for_training": verified >= 50,
         "engines": engines,
         "unreadable": unreadable,
-        "disk_usage_mb": round((pending_bytes + verified_bytes) / (1024 * 1024), 2),
+        "disk_usage_mb": round(used / (1024 * 1024), 2),
+        "disk_budget_gb": FEEDBACK_MAX_GB,
+        "disk_used_pct": round(used / (FEEDBACK_MAX_GB * 1024 ** 3) * 100, 1),
     }
 
 
@@ -1391,6 +1410,88 @@ def _collect_pending(limit: int, offset: int) -> dict:
         "offset": offset,
         "unreadable": unreadable,
     }
+
+
+def _prune_feedback_storage() -> dict:
+    """Delete the oldest pending entries until storage fits FEEDBACK_MAX_GB.
+
+    Entry ids are timestamp-prefixed, so sorting by filename is chronological.
+
+    verified/ is never pruned -- those entries carry human-corrected text and
+    are the only ones with training value -- but its size counts against the
+    budget, so a verified set larger than the budget stops pruning rather than
+    deleting every pending entry in a futile attempt to get under it.
+    """
+    pending_dir = os.path.join(FEEDBACK_DIR, "pending")
+    verified_dir = os.path.join(FEEDBACK_DIR, "verified")
+    budget = FEEDBACK_MAX_GB * (1024 ** 3)
+
+    # Group files by entry id so an entry's .json and .png are removed together.
+    entries: dict = {}
+    pending_bytes = 0
+    if os.path.isdir(pending_dir):
+        with os.scandir(pending_dir) as it:
+            for e in it:
+                try:
+                    size = e.stat().st_size
+                except OSError:
+                    continue
+                pending_bytes += size
+                entry_id, _, ext = e.name.rpartition(".")
+                if not entry_id or ext not in ("json", "png"):
+                    continue
+                slot = entries.setdefault(entry_id, [0, []])
+                slot[0] += size
+                slot[1].append(e.path)
+
+    verified_bytes = _scan_feedback_dir(verified_dir, with_size=True)[1]
+    total = pending_bytes + verified_bytes
+
+    if total <= budget:
+        return {"pruned": 0, "freed_bytes": 0, "total_bytes": total,
+                "budget_bytes": int(budget), "over_budget": False}
+
+    freed = 0
+    pruned = 0
+    # Oldest first.
+    for entry_id in sorted(entries):
+        if total - freed <= budget:
+            break
+        size, paths = entries[entry_id]
+        for path in paths:
+            try:
+                os.remove(path)
+            except OSError:
+                continue
+        freed += size
+        pruned += 1
+
+    return {"pruned": pruned, "freed_bytes": freed, "total_bytes": total - freed,
+            "budget_bytes": int(budget), "over_budget": (total - freed) > budget}
+
+
+async def _feedback_prune_loop():
+    """Enforce the storage budget at startup and periodically thereafter."""
+    while True:
+        try:
+            stats = await asyncio.to_thread(_prune_feedback_storage)
+            if stats["pruned"]:
+                logger.info(
+                    "Feedback prune: removed %d entries, freed %.2f GB, now %.2f GB / %.2f GB budget",
+                    stats["pruned"], stats["freed_bytes"] / 1024 ** 3,
+                    stats["total_bytes"] / 1024 ** 3, FEEDBACK_MAX_GB,
+                )
+            if stats["over_budget"]:
+                logger.warning(
+                    "Feedback storage still over budget (%.2f GB > %.2f GB) — "
+                    "verified/ alone exceeds it and is never pruned",
+                    stats["total_bytes"] / 1024 ** 3, FEEDBACK_MAX_GB,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("Feedback prune failed: %s", e)
+        await asyncio.sleep(FEEDBACK_PRUNE_INTERVAL_S)
 
 
 @app.get("/feedback/stats")
