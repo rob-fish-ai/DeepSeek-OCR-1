@@ -12,7 +12,11 @@ IMAGE_SIZE = 640
 CROP_MODE = True
 MIN_CROPS= 2
 MAX_CROPS= 9 # max:9; Increased from 6 for better accuracy on dense pages.
-MAX_CONCURRENCY = 24 # vLLM max_num_seqs. Higher values cause engine-iteration timeouts and AsyncEngineDeadError under heavy batches on this GPU/model size.
+# vLLM max_num_seqs. Env-overridable so the batching/accuracy trade-off can be
+# measured without editing source: batching changes decode numerics, and a page
+# that is perfectly deterministic alone can fall into a generation loop when
+# batched (measured: 0/10 corrupted at 1, 6/16 at 16, erratic in between).
+MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "24"))
 NUM_WORKERS = 64 # image pre-process (resize/padding) workers 
 PRINT_NUM_VIS_TOKENS = False
 SKIP_REPEAT = False

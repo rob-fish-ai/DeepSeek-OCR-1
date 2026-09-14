@@ -474,6 +474,34 @@ examples, not labelled production data; see *Calibration debt* below.
 - `hallucination_ratio < 0.25` — severe hallucination
 - `token_efficiency < 0.2` — stuck generation loop
 
+### Batching vs reproducibility
+
+`MAX_CONCURRENCY` (vLLM `max_num_seqs`, env-overridable) trades throughput
+against determinism. Batching changes decode numerics, so at temperature 0 a
+page that is perfectly stable alone can diverge — sometimes into a generation
+loop that runs to the length limit.
+
+Measured on this A100, 12 mixed pages, 8 concurrent clients, retry enabled:
+
+| `MAX_CONCURRENCY` | Throughput | Corrupted | Reproducible |
+|---|---|---|---|
+| 1 | 21.0 s/page | 0/12 | yes — byte-identical token counts across repeats |
+| 24 | 9.8 s/page | 2/12 | no — same page gave 1214/1305/1305/1412 tokens |
+
+Intermediate values do not help predictably. A single page swept across
+concurrency 2/4/6/8/12/16 looped 6%/68%/6%/56%/31%/37% of the time — the rate
+tracks exact batch composition at each scheduler step, not the cap itself.
+
+Corrupted pages are **flagged, not silent**: a loop trips the 0.35 cap and
+reports `truncated_output`, so a caller routing red pages to review loses
+correctness only if it ignores the flag. Retry recovers a large share —
+at concurrency 8 the same page went from 87% corrupted with `retry=false`
+to 31% with `retry=true`.
+
+Choose 1 when reproducibility matters (the same document must OCR identically
+twice) and the higher cost is acceptable; keep the default when throughput
+dominates and the flags are acted on.
+
 ### Calibration debt
 
 There is no ground truth for any of this. The feedback corpus stores only
