@@ -11,3 +11,4 @@ feedback/
 images/
 .venv/
 venv/
+.ipynb_checkpoints/
