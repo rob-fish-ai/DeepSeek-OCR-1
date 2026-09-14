@@ -16,6 +16,7 @@ Design principles:
 """
 
 import re
+import zlib
 from collections import Counter
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
@@ -29,11 +30,17 @@ if TYPE_CHECKING:
 # Scoring weights — must sum to 1.0
 # ---------------------------------------------------------------------------
 
+# self_consistency is deliberately weighted 0.0. It compares a result against
+# other runs of the same page, so it is only meaningful while ranking retry
+# candidates -- at report time nothing passes other_results and it is a flat
+# 1.0, i.e. a constant offset with no discriminative power. It stays in the
+# breakdown (and still drives retry ranking in select_best_result) but no
+# longer inflates every composite by 0.20.
 DEFAULT_WEIGHTS = {
-    "self_consistency": 0.20,
-    "hallucination_ratio": 0.25,
-    "token_efficiency": 0.20,
-    "structural_integrity": 0.10,
+    "self_consistency": 0.00,
+    "hallucination_ratio": 0.30,
+    "token_efficiency": 0.30,
+    "structural_integrity": 0.15,
     "repetition_density": 0.10,
     "content_density": 0.15,
 }
@@ -86,6 +93,12 @@ class OCRResult:
     preset_name: str = "adaptive"
     score: Optional[ScoreBreakdown] = None
     clean_stats: Optional["CleanStats"] = None
+    # Whether generation stopped because it ran out of room rather than
+    # because the model emitted a stop token. vLLM reports this directly as
+    # finish_reason == "length"; inferring it from num_tokens/max_tokens does
+    # not work, because the usable budget is max_model_len minus the prompt
+    # (~7,280 tokens for a 144-DPI A4 page, never the configured 8,192).
+    hit_length_limit: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -145,26 +158,37 @@ def _score_hallucination_ratio(result: OCRResult) -> float:
 
 
 def _score_token_efficiency(result: OCRResult) -> float:
-    """Penalize max-token runs with little clean output.
+    """Penalize runs that were cut off mid-generation.
 
-    If the model generated max_tokens but the clean output is tiny,
-    the model was stuck in a hallucination loop. Applies a smooth
-    curve rather than hard cutoffs.
+    Whether the model ran out of room is reported by the engine as
+    finish_reason == "length"; it cannot be inferred from
+    num_tokens / max_tokens, because the usable budget is max_model_len
+    minus the prompt and the configured max_tokens is never reachable.
+
+    A run that stopped on its own is complete by definition. A run that was
+    cut off lost content, and the more of its output failed to survive
+    cleaning, the more of it was degenerate rather than real text.
     """
-    token_ratio = result.num_tokens / result.max_tokens
-    clean_len = len(result.clean_text.strip())
-
-    # If tokens < 80% of max, model stopped naturally — likely good
-    if token_ratio < 0.8:
+    if not result.hit_length_limit:
         return 1.0
 
-    # Model hit or nearly hit max tokens — check if output is substantial
-    expected_min_chars = result.num_tokens * 0.5
-    if clean_len >= expected_min_chars:
-        return 0.9  # hit max but has real content — normal for dense docs
-    ratio = clean_len / expected_min_chars if expected_min_chars > 0 else 0
-    # Smooth curve: 0.9 at ratio=1.0 down to 0.1 at ratio=0
-    return max(0.1, 0.9 * ratio)
+    clean_len = len(result.clean_text.strip())
+    raw_len = len(result.raw_text.strip())
+    if raw_len == 0:
+        return 0.1
+
+    # Grounding tags are expected output format, not content, and they are a
+    # large fraction of the raw text. Excluding them here matches what
+    # _score_hallucination_ratio does; leaving them in depressed survival for
+    # every grounded page and pushed truncated-but-good pages into red.
+    effective_raw = max(1, raw_len - _measure_grounding_tags(result.raw_text))
+
+    # Of everything the model emitted before running out of room, how much
+    # was real content? A truncated dense page keeps nearly all of it; a
+    # generation loop is almost entirely stripped by post-processing.
+    survival = clean_len / effective_raw
+    # Cap at 0.8: the page was cut off, so it is incomplete regardless.
+    return max(0.1, min(0.8, survival))
 
 
 def _score_structural_integrity(result: OCRResult) -> float:
@@ -226,66 +250,34 @@ def _score_structural_integrity(result: OCRResult) -> float:
 
 
 def _score_repetition_density(result: OCRResult) -> float:
-    """Detect remaining repetitive patterns in the clean output.
+    """Detect generation loops via tail-vs-head compressibility.
 
-    Strips HTML/XML tags before analysis since table markup is naturally
-    repetitive. Uses longer n-gram windows and a higher repeat threshold
-    to avoid false positives on documents with natural repetition
-    (legal text, form labels, financial data).
+    Measured on the RAW output: post-processing strips runaway table rows and
+    repeated patterns, so by the time the text is cleaned the evidence of a
+    loop is frequently gone.
+
+    Replaces an n-gram counting version that saturated to 0.0 on any
+    structured document -- an invoice with twelve line items and a true
+    generation loop both scored 0.000 -- making it a flat penalty on exactly
+    the forms and invoices this service handles rather than a signal.
     """
-    # Strip HTML tags so table markup doesn't count
-    text = re.sub(r"<[^>]+>", " ", result.clean_text)
-    text = re.sub(r"\s+", " ", text).strip()
-
-    if len(text) < 100:
-        return 1.0  # too short to judge — assume OK
-
-    # Only check longer sequences (6+ chars) to avoid matching common
-    # short words/phrases that repeat naturally in any document
-    total_repeated = 0
-    for seq_len in [6, 10, 15, 20]:
-        seen = Counter()
-        for i in range(len(text) - seq_len):
-            chunk = text[i:i + seq_len]
-            if chunk.strip():
-                seen[chunk] += 1
-        # Only count sequences that appear 8+ times (higher bar)
-        for chunk, count in seen.items():
-            if count >= 8:
-                total_repeated += len(chunk) * (count - 1)
-
-    repetition_ratio = total_repeated / len(text) if text else 0
-    # More forgiving: scale factor 0.3 instead of 0.5
-    return max(0.0, 1.0 - repetition_ratio * 0.3)
+    return 1.0 - _measure_degeneration(result.raw_text)
 
 
-def _score_content_density(
-    result: OCRResult,
-    image_width: int = 0,
-    image_height: int = 0,
-) -> float:
-    """Ratio of clean text to image area.
+def _score_content_density(result: OCRResult) -> float:
+    """How much text was extracted, in absolute terms.
 
-    Very short output from a large image suggests the model failed
-    to extract most of the content. Uses smooth scaling rather than
-    hard cutoffs to handle diverse document types — a short receipt
-    and a dense legal page are both valid.
+    A pixel-ratio variant used to live here, scaled against the image area.
+    It was removed: it scored a normal A4 page at ~0.26 while the char-count
+    path scored the same text 1.0, and since the two paths were compared
+    against each other by the PDF and batch endpoints, retries were
+    systematically discarded. Nothing passed image dimensions any more, so
+    the branch was also dead.
     """
     clean_len = len(result.clean_text.strip())
 
     if clean_len == 0:
         return 0.0
-
-    # With image dimensions: use pixel-to-char ratio
-    if image_width > 0 and image_height > 0:
-        image_area = image_width * image_height
-        # Expect roughly 1 char per 200 pixels for average documents
-        # (more forgiving than 1:100 — handles sparse docs like receipts)
-        expected_chars = image_area / 200
-        ratio = clean_len / expected_chars
-        return min(ratio, 1.0)
-
-    # Without dimensions: smooth curve based on absolute char count
     if clean_len >= 500:
         return 1.0
     if clean_len >= 100:
@@ -293,6 +285,42 @@ def _score_content_density(
     if clean_len >= 20:
         return 0.2 + 0.3 * ((clean_len - 20) / 80)
     return 0.1
+
+
+# Minimum characters before the tail/head comparison is meaningful — zlib's
+# fixed overhead dominates short buffers and makes the ratio noise.
+_DEGENERATION_MIN_CHARS = 2000
+
+
+def _measure_degeneration(text: str) -> float:
+    """How much more compressible the tail of the output is than its head.
+
+    A generation loop decays over time, so its last quarter collapses to
+    near-nothing while its first quarter still looks like real text. Uniform
+    repetition -- a form with repeated labels, an invoice with similar line
+    items -- compresses the same at both ends and scores ~0.
+
+    Returns 0.0 (uniform) to ~1.0 (tail fully collapsed).
+
+    Blind spot: markup is stripped before measuring, so a loop made purely of
+    empty table cells leaves nothing to compare and this returns 0.0. Those
+    are caught by _score_token_efficiency instead -- post-processing strips
+    the bloat, so almost nothing survives and survival collapses. Measuring
+    with markup included was rejected: a legitimate dense table compresses
+    just as hard and would be capped as a loop.
+    """
+    stripped = _GROUNDING_TAG_PATTERN.sub(" ", text)
+    stripped = re.sub(r"<[^>]+>", " ", stripped)
+    stripped = re.sub(r"\s+", " ", stripped).strip().encode("utf-8", "ignore")
+    if len(stripped) < _DEGENERATION_MIN_CHARS:
+        return 0.0
+
+    quarter = len(stripped) // 4
+    head = len(zlib.compress(stripped[:quarter], 6)) / quarter
+    tail = len(zlib.compress(stripped[-quarter:], 6)) / quarter
+    if head <= 0:
+        return 0.0
+    return max(0.0, (head - tail) / head)
 
 
 def _score_self_consistency(
@@ -315,10 +343,17 @@ def _score_self_consistency(
 
     similarities = []
     for other in others:
+        # autojunk=False is essential. With the default, any character
+        # occurring in >1% of a string longer than 200 chars is treated as
+        # junk -- which is nearly every letter in real text, and catastrophic
+        # on repetitive content like table markup: two near-identical tables
+        # score 0.009 instead of 0.949. That is what crushed table-heavy
+        # pages to ~0.12 composite under the previous weighting.
         ratio = SequenceMatcher(
             None,
             current.clean_text,
             other.clean_text,
+            autojunk=False,
         ).ratio()
         similarities.append(ratio)
 
@@ -332,20 +367,95 @@ def _score_self_consistency(
 # Composite scoring
 # ---------------------------------------------------------------------------
 
+def _compression_ratio(text: str) -> float:
+    """Compressed size over raw size for the whole output. Lower = more
+    repetitive. Normal prose sits around 0.25-0.40; a generation loop
+    collapses below 0.05.
+
+    Only safe to act on when the run hit the length limit: a legitimate form
+    with forty repeated label rows also compresses to ~0.03, and must not be
+    treated as a loop.
+    """
+    stripped = _GROUNDING_TAG_PATTERN.sub(" ", text)
+    stripped = re.sub(r"<[^>]+>", " ", stripped)
+    stripped = re.sub(r"\s+", " ", stripped).strip().encode("utf-8", "ignore")
+    if len(stripped) < _DEGENERATION_MIN_CHARS:
+        return 1.0
+    return len(zlib.compress(stripped, 6)) / len(stripped)
+
+
+# A run that was cut off AND either collapsed toward the end or is uniformly
+# near-incompressible is a generation loop.
+# Gated on hit_length_limit so it can only fire on runs that actually ran out
+# of room, which is the only situation where loops occur -- a page that
+# stopped on its own is never penalised by this, however repetitive it is.
+_LOOP_DEGENERATION_THRESHOLD = 0.45
+# Measured: true loops land at 0.006-0.016, while a legitimate form with
+# forty repeated label rows sits at 0.028 and an invoice with repeated line
+# items at 0.048. 0.025 sits in that gap. This is calibrated on constructed
+# examples, not labelled production data -- see the note in compute_flags.
+_LOOP_COMPRESSION_THRESHOLD = 0.025
+_LOOP_COMPOSITE_CAP = 0.35
+
+
+def _apply_composite(
+    breakdown: ScoreBreakdown,
+    result: OCRResult,
+    w: dict,
+) -> float:
+    """Weighted sum plus the hard caps, in one place.
+
+    score_result and select_best_result both need this; they used to carry
+    separate copies of the formula, which had already drifted apart.
+    """
+    composite = (
+        w["self_consistency"] * breakdown.self_consistency
+        + w["hallucination_ratio"] * breakdown.hallucination_ratio
+        + w["token_efficiency"] * breakdown.token_efficiency
+        + w["structural_integrity"] * breakdown.structural_integrity
+        + w["repetition_density"] * breakdown.repetition_density
+        + w["content_density"] * breakdown.content_density
+    )
+
+    # Blank / near-blank pages: several metrics return perfect scores on empty
+    # output, so cap rather than let the composite float up.
+    clean_len = len(result.clean_text.strip())
+    if clean_len <= 10:
+        composite = min(composite, 0.10)
+    elif clean_len <= 30:
+        composite = min(composite, 0.30)
+
+    # Generation loop: ran out of room with a collapsed tail. Without this a
+    # verbose loop scores green, because it produces plenty of characters and
+    # only trips repetition_density, which carries 0.10 of the weight.
+    # Two shapes of loop: one that decays partway through (tail collapses
+    # relative to head), and one that starts early enough that head and tail
+    # look alike and only absolute compressibility gives it away.
+    if result.hit_length_limit and (
+        _measure_degeneration(result.raw_text) > _LOOP_DEGENERATION_THRESHOLD
+        or _compression_ratio(result.raw_text) < _LOOP_COMPRESSION_THRESHOLD
+    ):
+        composite = min(composite, _LOOP_COMPOSITE_CAP)
+
+    return composite
+
+
 def score_result(
     result: OCRResult,
     other_results: Optional[list[OCRResult]] = None,
-    image_width: int = 0,
-    image_height: int = 0,
     weights: Optional[dict] = None,
 ) -> ScoreBreakdown:
     """Compute the weighted composite quality score for an OCR result.
 
+    Note this measures whether generation behaved normally -- it is computed
+    entirely from the output text and never compares against the image, so it
+    cannot detect fluent-but-wrong OCR.
+
     Args:
         result: The OCR result to score.
         other_results: Other runs of the same image for self-consistency.
-        image_width: Original image width (0 if unknown).
-        image_height: Original image height (0 if unknown).
+            Only meaningful when ranking retry candidates; self_consistency
+            carries no weight in the composite.
         weights: Override default scoring weights.
 
     Returns:
@@ -362,29 +472,9 @@ def score_result(
     breakdown.token_efficiency = _score_token_efficiency(result)
     breakdown.structural_integrity = _score_structural_integrity(result)
     breakdown.repetition_density = _score_repetition_density(result)
-    breakdown.content_density = _score_content_density(
-        result, image_width, image_height
-    )
+    breakdown.content_density = _score_content_density(result)
 
-    composite = (
-        w["self_consistency"] * breakdown.self_consistency
-        + w["hallucination_ratio"] * breakdown.hallucination_ratio
-        + w["token_efficiency"] * breakdown.token_efficiency
-        + w["structural_integrity"] * breakdown.structural_integrity
-        + w["repetition_density"] * breakdown.repetition_density
-        + w["content_density"] * breakdown.content_density
-    )
-
-    # Cap score for blank/near-blank pages — metrics like self_consistency
-    # and token_efficiency return perfect scores on empty output, inflating
-    # the composite. Hard cap ensures the number matches reality.
-    clean_len = len(result.clean_text.strip())
-    if clean_len <= 10:
-        composite = min(composite, 0.10)
-    elif clean_len <= 30:
-        composite = min(composite, 0.30)
-
-    breakdown.composite = composite
+    breakdown.composite = _apply_composite(breakdown, result, w)
 
     result.score = breakdown
     return breakdown
@@ -398,31 +488,26 @@ def select_best_result(results: list[OCRResult]) -> OCRResult:
     if len(results) == 1:
         return results[0]
 
-    # Re-score self_consistency with the full result set
+    # Re-score self_consistency with the full result set. It carries no
+    # weight in the composite, but agreement between attempts is still a
+    # useful tie-breaker, so it is applied explicitly below rather than
+    # through the weights.
     for i, result in enumerate(results):
         others = [r for j, r in enumerate(results) if j != i]
         if result.score is not None:
             result.score.self_consistency = _score_self_consistency(
                 result, others
             )
-            w = result.score.weights
-            composite = (
-                w["self_consistency"] * result.score.self_consistency
-                + w["hallucination_ratio"] * result.score.hallucination_ratio
-                + w["token_efficiency"] * result.score.token_efficiency
-                + w["structural_integrity"] * result.score.structural_integrity
-                + w["repetition_density"] * result.score.repetition_density
-                + w["content_density"] * result.score.content_density
+            result.score.composite = _apply_composite(
+                result.score, result, result.score.weights
             )
-            # Apply same blank-page cap as score_result
-            clean_len = len(result.clean_text.strip())
-            if clean_len <= 10:
-                composite = min(composite, 0.10)
-            elif clean_len <= 30:
-                composite = min(composite, 0.30)
-            result.score.composite = composite
 
-    return max(results, key=lambda r: r.score.composite if r.score else 0.0)
+    def _rank(r: OCRResult) -> tuple:
+        if r.score is None:
+            return (0.0, 0.0)
+        return (r.score.composite, r.score.self_consistency)
+
+    return max(results, key=_rank)
 
 
 def needs_retry(
@@ -525,12 +610,23 @@ def compute_flags(
         })
         has_warning = True
 
-    # Flag token efficiency if extreme
+    # Generation ran out of room. The text we did get may be fine, but the
+    # bottom of the page is missing, so this must not read green.
+    if result.hit_length_limit:
+        details.append({
+            "code": "truncated_output",
+            "severity": "warning",
+            "message": "Generation hit the length limit — the end of the page is missing.",
+        })
+        has_warning = True
+
+    # Cut off with almost nothing surviving post-processing: a loop, not a
+    # dense page that ran long.
     if score.token_efficiency < 0.2:
         details.append({
             "code": "max_tokens_hit",
             "severity": "warning",
-            "message": "Model hit token limit with very little clean output — likely stuck in a generation loop.",
+            "message": "Model hit the length limit with very little clean output — likely stuck in a generation loop.",
         })
         has_warning = True
 

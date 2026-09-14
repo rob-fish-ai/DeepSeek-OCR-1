@@ -252,6 +252,11 @@ def _save_feedback(image: Image.Image, result: dict, filename: str = None):
             "filename": filename,
             "ocr_engine": result.get("ocr_engine"),
             "score": result.get("score", {}).get("composite"),
+            # Recorded so stored entries can be re-scored offline. num_tokens
+            # was previously omitted, which left every archived entry at 0 and
+            # made the corpus useless for calibrating token-related metrics.
+            "num_tokens": result.get("num_tokens"),
+            "score_variables": result.get("score", {}).get("variables"),
             "flag": result.get("flag"),
             "text": result.get("text", ""),
             "raw_text": result.get("raw_text", ""),
@@ -445,10 +450,20 @@ async def _run_inference(image: Image.Image, prompt_key: str = DEFAULT_PROMPT) -
     if final_output is None:
         raise HTTPException(500, "Inference returned no output")
 
-    text = final_output.outputs[0].text
-    num_tokens = len(final_output.outputs[0].token_ids)
+    completion = final_output.outputs[0]
+    text = completion.text
+    num_tokens = len(completion.token_ids)
 
-    return {"text": text, "num_tokens": num_tokens}
+    # finish_reason == "length" means generation ran out of room rather than
+    # emitting a stop token. This cannot be inferred from num_tokens, because
+    # the usable budget is MAX_MODEL_LEN minus the prompt (~7,280 tokens for a
+    # 144-DPI A4 page) and MAX_TOKENS is never reachable.
+    return {
+        "text": text,
+        "num_tokens": num_tokens,
+        "prompt_tokens": len(final_output.prompt_token_ids or []),
+        "hit_length_limit": getattr(completion, "finish_reason", None) == "length",
+    }
 
 
 async def _format_result(inference_output: dict, raw: bool, image: Image.Image = None) -> dict:
@@ -465,6 +480,7 @@ async def _format_result(inference_output: dict, raw: bool, image: Image.Image =
         num_tokens=num_tokens,
         max_tokens=MAX_TOKENS,
         clean_stats=stats,
+        hit_length_limit=inference_output.get("hit_length_limit", False),
     )
     score = score_result(ocr_result)
     flag_info = compute_flags(ocr_result, SCORE_THRESHOLD)
@@ -516,7 +532,7 @@ async def _format_result(inference_output: dict, raw: bool, image: Image.Image =
     # Flag incomplete extraction: model hit max tokens and most output was hallucinated
     if (
         not result["needs_external_ocr"]
-        and num_tokens >= MAX_TOKENS * 0.85
+        and inference_output.get("hit_length_limit", False)
         and raw_len > 0
         and clean_len / raw_len < 0.10
         and score.composite < SCORE_THRESHOLD
@@ -579,6 +595,7 @@ async def _run_inference_with_retry(
             max_tokens=MAX_TOKENS,
             preset_name=preset["name"],
             clean_stats=retry_stats,
+            hit_length_limit=output.get("hit_length_limit", False),
         )
         # No image dimensions here: _score_content_density switches to a
         # pixel-ratio scale when given them, which scores a normal page ~0.26
@@ -660,7 +677,7 @@ async def _run_inference_with_retry(
     # Flag incomplete extraction: model hit max tokens and most output was hallucinated
     if (
         not result["needs_external_ocr"]
-        and best.num_tokens >= MAX_TOKENS * 0.85
+        and best.hit_length_limit
         and raw_len > 0
         and clean_len / raw_len < 0.10
         and composite < SCORE_THRESHOLD

@@ -317,17 +317,33 @@ This distinction is critical for accurate hallucination scoring — dedup remova
 Six independent metrics, each normalized to 0.0-1.0, combined with fixed weights:
 
 ```
-Composite = 0.25 × hallucination_ratio
-          + 0.20 × self_consistency
-          + 0.20 × token_efficiency
+Composite = 0.30 × hallucination_ratio
+          + 0.30 × token_efficiency
           + 0.15 × content_density
-          + 0.10 × structural_integrity
+          + 0.15 × structural_integrity
           + 0.10 × repetition_density
+          + 0.00 × self_consistency
 ```
+
+**The composite measures whether generation behaved normally, not whether the
+text is correct.** Every metric is computed from the output string; none
+compares against the image, so fluent-but-wrong OCR is invisible by
+construction. Treat a green flag as "the model did not visibly malfunction".
+
+Two hard caps override the weighted sum:
+
+| Condition | Cap |
+|-----------|-----|
+| Clean text ≤ 10 chars | 0.10 |
+| Clean text ≤ 30 chars | 0.30 |
+| Ran out of room **and** output collapsed (see repetition_density) | 0.35 |
+
+The caps do most of the work at the failure end: in a sample of 1,499 stored
+results, 40.8% were exactly 0.100 and 4.7% exactly 0.300.
 
 ### Metric Details
 
-#### hallucination_ratio (weight: 0.25)
+#### hallucination_ratio (weight: 0.30)
 
 Measures how much raw output survived post-processing.
 
@@ -340,35 +356,53 @@ ratio = clean_length / effective_raw
 - Dedup-removed content is also excluded.
 - If `effective_raw ≤ clean_length`: returns 1.0 (everything was tags).
 
-#### self_consistency (weight: 0.20)
+#### self_consistency (weight: 0.00)
 
-Pairwise text similarity between multiple OCR runs of the same image.
+Pairwise text similarity between multiple OCR runs of the same image, via
+`SequenceMatcher(..., autojunk=False)`.
 
-- Single-run: returns **1.0** (deterministic at temp=0, cannot measure consistency, should not penalize).
-- Multiple runs: average `SequenceMatcher.ratio()` across all pairs.
+**Carries no weight in the composite.** It can only be computed when several
+attempts exist, so at report time it is always 1.0 — a constant offset with no
+discriminative power. It is still computed, reported in the breakdown, and
+used by `select_best_result` to rank retry candidates and break ties.
 
-#### token_efficiency (weight: 0.20)
+`autojunk=False` is required, not cosmetic: with the default, any character
+appearing in >1% of a string longer than 200 chars is treated as junk, which
+is nearly every letter in real text. Two near-identical tables score 0.009
+instead of 0.949, which used to crush table-heavy pages to ~0.12 composite.
 
-Penalizes max-token runs with little clean output (stuck generation loops).
+#### token_efficiency (weight: 0.30)
+
+Whether generation was cut off, and how much of what it emitted was real.
 
 ```
-if tokens < 80% of max → 1.0 (stopped naturally)
-if tokens ≥ 80% of max:
-  expected_min = tokens × 0.5
-  if clean_len ≥ expected_min → 0.9 (hit max but has real content)
-  else → smooth curve 0.1 to 0.9
+if finish_reason != "length" → 1.0 (the model stopped on its own)
+otherwise:
+  effective_raw = raw_length - grounding_tag_chars
+  survival      = clean_length / effective_raw
+  score         = clamp(survival, 0.1, 0.8)      # capped: the page is incomplete
 ```
+
+Whether the model ran out of room is taken from the engine's `finish_reason`,
+**not** inferred from `num_tokens / MAX_TOKENS`. The usable budget is
+`max_model_len` minus the prompt — about 7,280 tokens for a 144-DPI A4 page,
+where the prompt costs ~913 — so the configured `MAX_TOKENS` of 8,192 is never
+reachable and any threshold expressed as a fraction of it is unreliable.
 
 #### content_density (weight: 0.15)
 
-Text volume relative to image area.
+Absolute volume of extracted text.
 
 ```
-With dimensions:  expected = pixels / 200, ratio = clean_len / expected
-Without:          smooth curve: ≥500 chars → 1.0, ≥100 → 0.5-1.0, ≥20 → 0.2-0.5
+≥500 chars → 1.0, ≥100 → 0.5-1.0, ≥20 → 0.2-0.5, else 0.1
 ```
 
-#### structural_integrity (weight: 0.10)
+An earlier pixel-ratio variant scaled this against image area. It was removed:
+it scored a normal A4 page ~0.26 where the char-count path scored the same
+text 1.0, and because the two paths were compared against each other by the
+PDF and batch endpoints, retries were systematically discarded.
+
+#### structural_integrity (weight: 0.15)
 
 Presence of recognizable patterns (does NOT require any specific structure):
 
@@ -383,21 +417,50 @@ Scoring: 1 signal = 0.75, 2 = 0.875, 3 = 0.95, 4 = 1.0. Substantial text with no
 
 #### repetition_density (weight: 0.10)
 
-Remaining repetitive n-grams after cleanup (strips HTML tags first).
-
-- Checks n-grams at lengths 6, 10, 15, 20
-- Only counts sequences appearing 8+ times
-- `score = max(0, 1.0 - repetition_ratio × 0.3)`
-- Text < 100 chars: returns 1.0 (too short to judge)
-
-### Blank Page Caps
-
-Prevents score inflation on empty output:
+Detects generation loops by comparing how compressible the **tail** of the raw
+output is against its **head**. A loop decays over time, so its last quarter
+collapses while its first quarter still looks like text; uniform repetition —
+a form with repeated labels, an invoice with similar line items — compresses
+the same at both ends and is not penalised.
 
 ```
-clean_text ≤ 10 chars → composite capped at 0.10
-clean_text ≤ 30 chars → composite capped at 0.30
+score = 1.0 - (zlib(head) - zlib(tail)) / zlib(head)
 ```
+
+- Measured on **raw** output: post-processing strips runaway rows and repeated
+  patterns, so by the time text is cleaned the evidence is often gone.
+- Grounding tags and markup are stripped before measuring.
+- Below 2,000 chars: returns 1.0 (zlib overhead makes short buffers noise).
+
+This replaced an n-gram counting version that saturated to 0.0 on any
+structured document — an invoice with twelve line items and a true generation
+loop both scored 0.000 — making it a flat penalty on exactly the forms and
+invoices this service handles rather than a signal.
+
+*Blind spot:* a loop made purely of empty table cells is stripped along with
+the markup and reads as 0.0. Those are caught by `token_efficiency` instead,
+since post-processing removes the bloat and survival collapses. Measuring with
+markup included was rejected — a legitimate dense table compresses just as
+hard and would be capped as a loop.
+
+### Hard Caps
+
+Applied after the weighted sum, in `_apply_composite`:
+
+```
+clean_text ≤ 10 chars                     → composite capped at 0.10
+clean_text ≤ 30 chars                     → composite capped at 0.30
+finish_reason == "length" AND (           → composite capped at 0.35
+    tail-vs-head degeneration > 0.45
+    OR whole-output compression < 0.025
+)
+```
+
+The loop cap is gated on `finish_reason` because a legitimate form with forty
+repeated label rows compresses to ~0.028 — close to a true loop's 0.006-0.016 —
+and must not be capped. Pages that stop on their own are never affected,
+however repetitive they are. These thresholds are calibrated on constructed
+examples, not labelled production data; see *Calibration debt* below.
 
 ### Flag Assignment
 
@@ -410,6 +473,19 @@ clean_text ≤ 30 chars → composite capped at 0.30
 **Warning downgrades** (green → yellow):
 - `hallucination_ratio < 0.25` — severe hallucination
 - `token_efficiency < 0.2` — stuck generation loop
+
+### Calibration debt
+
+There is no ground truth for any of this. The feedback corpus stores only
+results scoring below 0.70, so it contains no known-good pages to validate
+against, and none of the ~39,000 stored entries has verified corrected text.
+Thresholds here were chosen from constructed examples plus the observed
+behaviour of real pages, not measured against labelled data.
+
+To close this, collect corrected text via `POST /feedback/correct` and re-score
+offline. Stored entries now record `num_tokens` and the full `score_variables`
+breakdown for exactly this purpose — entries archived before that change have
+`num_tokens: 0` and cannot be used to calibrate token-related metrics.
 
 ---
 
