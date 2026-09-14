@@ -959,10 +959,16 @@ async def ocr_pdf(
     pdf_bytes = await file.read()
     _check_file_size(pdf_bytes, MAX_PDF_SIZE_MB, "PDF")
 
-    # Read page count once, before dispatching workers.
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    num_pages = len(doc)
-    doc.close()
+    # Read page count once, before dispatching workers. A malformed or
+    # non-PDF upload raises here; that is a client error, not a server one.
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        num_pages = len(doc)
+        doc.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, f"Could not read PDF: {e}")
 
     if num_pages == 0:
         raise HTTPException(400, "Could not extract any pages from the PDF")
