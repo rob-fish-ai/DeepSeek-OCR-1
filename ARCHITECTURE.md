@@ -477,7 +477,7 @@ examples, not labelled production data; see *Calibration debt* below.
 ### Request logging
 
 Every request gets an ID. A caller may supply one in `X-Request-ID` (letters,
-digits and `._:-`, up to 128 chars — anything else is replaced); otherwise one is
+digits and `_.:-`, up to 128 chars — anything else is replaced); otherwise one is
 generated. It is returned in the `X-Request-ID` response header, stamped on every
 application log line as `[<id>]`, and used as the prefix of vLLM's own engine
 request IDs, so `Added/Finished request <id>-xxxxxxxx` lines trace back too.

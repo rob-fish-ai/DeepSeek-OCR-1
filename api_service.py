@@ -313,6 +313,10 @@ def _save_feedback(image: Image.Image, result: dict, filename: str = None):
         meta = {
             "id": entry_id,
             "timestamp": timestamp,
+            # Ties the entry to its request log line, and lets test or eval
+            # traffic (sent with an X-Request-ID such as "eval-...") be
+            # excluded when the corpus is used for training or calibration.
+            "request_id": rl.request_id_var.get(),
             "filename": filename,
             "ocr_engine": result.get("ocr_engine"),
             "score": result.get("score", {}).get("composite"),

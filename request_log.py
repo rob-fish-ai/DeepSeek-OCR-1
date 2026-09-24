@@ -31,7 +31,7 @@ request_ctx_var: contextvars.ContextVar[Optional["RequestContext"]] = contextvar
 
 # Caller-supplied IDs are echoed into logs and response headers, so only a
 # conservative character set is accepted; anything else gets a fresh ID.
-_VALID_REQUEST_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+_VALID_REQUEST_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 
 _request_logger = logging.getLogger("deepseek-ocr.requests")
 _installed = False
