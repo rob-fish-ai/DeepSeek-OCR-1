@@ -474,6 +474,46 @@ examples, not labelled production data; see *Calibration debt* below.
 - `hallucination_ratio < 0.25` — severe hallucination
 - `token_efficiency < 0.2` — stuck generation loop
 
+### Request logging
+
+Every request gets an ID. A caller may supply one in `X-Request-ID` (letters,
+digits and `._:-`, up to 128 chars — anything else is replaced); otherwise one is
+generated. It is returned in the `X-Request-ID` response header, stamped on every
+application log line as `[<id>]`, and used as the prefix of vLLM's own engine
+request IDs, so `Added/Finished request <id>-xxxxxxxx` lines trace back too.
+
+Each request also writes one JSON line to `REQUEST_LOG_FILE`:
+
+```json
+{"ts": "...", "request_id": "...", "method": "POST", "path": "/ocr/pdf",
+ "status": 200, "duration_ms": 98158, "client": "154.54.102.19",
+ "params": {"prompt": "document", "dpi": 144, "raw": false, "retry": true},
+ "uploads": [{"bytes": 712345, "sha256_16": "…", "ext": ".pdf"}],
+ "pages": [{"page": 1, "flag": "green", "score": 0.966, "codes": [], "chars": 5153,
+            "tokens": 1780, "attempts": null, "preset": null, "engine": "deepseek",
+            "needs_external_ocr": false}],
+ "inference": {"calls": 3, "tokens": 10480, "hit_length_limit": 1, "ms": 95000,
+               "detail": [{"engine_request_id": "…", "prompt": "document",
+                           "prompt_tokens": 913, "tokens": 1780,
+                           "hit_length_limit": false, "ms": 23000}]},
+ "error": "HTTP 400: …"}
+```
+
+**No OCR text or images are logged.** Uploads are identified by size, extension
+and a 16-hex SHA-256 prefix, so a caller can confirm which file a request carried
+by hashing their own copy. Filenames are withheld unless `LOG_FILENAMES=true`.
+Validation errors record field names only, because FastAPI's error detail echoes
+submitted values, which can be an entire base64-encoded document.
+
+`/health`, `/`, and the docs pages get the header but no log line — the
+supervisor polls `/health` every 30 seconds.
+
+The request-tracking state lives in `request_log.py`, not `api_service.py`.
+Started as `python api_service.py`, that file executes twice (as `__main__`, then
+again when uvicorn imports `api_service:app`), so module-level state there
+exists twice and a context variable set by one copy would not be read by the
+other's log filter.
+
 ### Batching vs reproducibility
 
 `MAX_CONCURRENCY` (vLLM `max_num_seqs`, env-overridable) trades throughput
@@ -768,6 +808,10 @@ All OCR endpoints return:
 | `FEEDBACK_ENABLED` | `true` | Enable feedback storage |
 | `FEEDBACK_SCORE_THRESHOLD` | `0.70` | Save results below this score |
 | `FEEDBACK_MAX_GB` | `20` | Disk budget; oldest pending entries pruned above it |
+| `REQUEST_LOG_FILE` | `/workspace/logs/requests.jsonl` | One JSON line per request (see *Request logging*) |
+| `REQUEST_LOG_MAX_MB` / `REQUEST_LOG_BACKUPS` | `50` / `5` | Rotation for the request log |
+| `LOG_FILENAMES` | `false` | Include upload filenames in the request log (they often contain PII) |
+| `LOG_MAX_MB` / `LOG_BACKUPS` | `100` / `5` | Rotation for `api.log`, done by `supervise.sh` |
 | `FEEDBACK_PRUNE_INTERVAL_S` | `21600` | How often the budget is enforced |
 | `FEEDBACK_PAGE_MAX` | `500` | Max entries returned by `/feedback/pending` |
 

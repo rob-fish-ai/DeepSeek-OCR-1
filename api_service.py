@@ -34,9 +34,17 @@ VLLM_SRC = os.path.join(
 sys.path.insert(0, VLLM_SRC)
 
 import fitz  # PyMuPDF
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.exception_handlers import (
+    http_exception_handler,
+    request_validation_exception_handler,
+)
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from PIL import Image, ImageOps
+
+import request_log as rl
 
 from config import CROP_MODE, MAX_CONCURRENCY, NUM_WORKERS
 from deepseek_ocr import DeepseekOCRForCausalLM
@@ -66,9 +74,20 @@ from vllm.model_executor.models.registry import ModelRegistry
 # ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    format="%(asctime)s [%(levelname)s] %(name)s [%(request_id)s] — %(message)s",
 )
 logger = logging.getLogger("deepseek-ocr")
+
+# One JSON line per HTTP request (see request_log.py). Contains no OCR text or
+# images; filenames are omitted unless LOG_FILENAMES=true, since they often
+# carry personal data.
+REQUEST_LOG_FILE = os.environ.get(
+    "REQUEST_LOG_FILE", os.path.join(os.environ.get("LOG_DIR", "/workspace/logs"), "requests.jsonl")
+)
+REQUEST_LOG_MAX_MB = int(os.environ.get("REQUEST_LOG_MAX_MB", "50"))
+REQUEST_LOG_BACKUPS = int(os.environ.get("REQUEST_LOG_BACKUPS", "5"))
+LOG_FILENAMES = os.environ.get("LOG_FILENAMES", "false").lower() == "true"
+rl.install(REQUEST_LOG_FILE, REQUEST_LOG_MAX_MB, REQUEST_LOG_BACKUPS)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -128,6 +147,45 @@ worker_pool: Optional[ThreadPoolExecutor] = None
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _note_params(**params) -> None:
+    """Record request parameters for this request's log line."""
+    ctx = rl.request_ctx_var.get()
+    if ctx is not None:
+        ctx.params.update(params)
+
+
+def _note_upload(filename: Optional[str], data: bytes) -> None:
+    ctx = rl.request_ctx_var.get()
+    if ctx is not None:
+        ctx.uploads.append(rl.describe_upload(filename, data, LOG_FILENAMES))
+
+
+def _note_page(result: dict, **where) -> None:
+    """Record how one page came out. Metadata only — never the text."""
+    ctx = rl.request_ctx_var.get()
+    if ctx is None:
+        return
+    score = result.get("score") or {}
+    ctx.pages.append({
+        **where,
+        "flag": result.get("flag"),
+        "score": score.get("composite"),
+        "codes": [d.get("code") for d in result.get("flag_details") or []],
+        "chars": len(result.get("text") or ""),
+        "tokens": result.get("num_tokens"),
+        "attempts": result.get("attempts"),
+        "preset": result.get("preset"),
+        "engine": result.get("ocr_engine"),
+        "needs_external_ocr": result.get("needs_external_ocr"),
+    })
+
+
+def _respond(result: dict) -> JSONResponse:
+    """Return a single-page result, recording it for the request log."""
+    _note_page(result)
+    return JSONResponse(result)
 
 
 def is_blank_page(image: Image.Image, std_threshold: float = 5.0, dark_threshold: float = 0.02) -> bool:
@@ -434,8 +492,10 @@ async def _run_inference(image: Image.Image, prompt_key: str = DEFAULT_PROMPT) -
     loop = asyncio.get_event_loop()
     vllm_input = await loop.run_in_executor(None, preprocess_image, image, prompt_key)
 
-    # Generate a unique request ID
-    request_id = str(uuid.uuid4())
+    # Prefix the engine request ID with the HTTP request's ID, so vLLM's own
+    # "Added/Finished request ..." lines can be traced back to the caller.
+    request_id = f"{rl.request_id_var.get()}-{uuid.uuid4().hex[:8]}"
+    started = time.monotonic()
 
     # Submit to async engine — this returns an async generator
     results_generator = engine.generate(
@@ -459,6 +519,19 @@ async def _run_inference(image: Image.Image, prompt_key: str = DEFAULT_PROMPT) -
     completion = final_output.outputs[0]
     text = completion.text
     num_tokens = len(completion.token_ids)
+    prompt_tokens = len(final_output.prompt_token_ids or [])
+    hit_length_limit = getattr(completion, "finish_reason", None) == "length"
+
+    ctx = rl.request_ctx_var.get()
+    if ctx is not None:
+        ctx.inferences.append({
+            "engine_request_id": request_id,
+            "prompt": prompt_key,
+            "prompt_tokens": prompt_tokens,
+            "tokens": num_tokens,
+            "hit_length_limit": hit_length_limit,
+            "ms": round((time.monotonic() - started) * 1000),
+        })
 
     # finish_reason == "length" means generation ran out of room rather than
     # emitting a stop token. This cannot be inferred from num_tokens, because
@@ -467,8 +540,8 @@ async def _run_inference(image: Image.Image, prompt_key: str = DEFAULT_PROMPT) -
     return {
         "text": text,
         "num_tokens": num_tokens,
-        "prompt_tokens": len(final_output.prompt_token_ids or []),
-        "hit_length_limit": getattr(completion, "finish_reason", None) == "length",
+        "prompt_tokens": prompt_tokens,
+        "hit_length_limit": hit_length_limit,
     }
 
 
@@ -793,6 +866,64 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Paths polled by the supervisor or browsed by humans: they still get an
+# X-Request-ID header, but no request-log line, so the log stays signal.
+_UNLOGGED_PATHS = {"/health", "/", "/docs", "/openapi.json", "/redoc"}
+
+
+@app.middleware("http")
+async def request_logging(request: Request, call_next):
+    rid = rl.new_request_id(request.headers.get("x-request-id"))
+    ctx = rl.RequestContext(
+        rid, request.method, request.url.path,
+        request.client.host if request.client else None,
+        request.headers.get("x-forwarded-for"),
+    )
+    rid_token = rl.request_id_var.set(rid)
+    ctx_token = rl.request_ctx_var.set(ctx)
+    status = 500
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        response.headers["X-Request-ID"] = rid
+        return response
+    except Exception as e:
+        ctx.error = f"{type(e).__name__}: {e}"
+        raise
+    finally:
+        if request.url.path not in _UNLOGGED_PATHS:
+            record = ctx.summary(status)
+            rl.emit(record)
+            flags = [p["flag"] for p in ctx.pages if p.get("flag")]
+            logger.info(
+                "%s %s -> %d in %d ms (%d page(s)%s%s)",
+                request.method, request.url.path, status, record["duration_ms"], len(ctx.pages),
+                f", flags {','.join(flags)}" if flags else "",
+                f", error: {ctx.error}" if ctx.error else "",
+            )
+        rl.request_ctx_var.reset(ctx_token)
+        rl.request_id_var.reset(rid_token)
+
+
+@app.exception_handler(StarletteHTTPException)
+async def _log_http_exception(request: Request, exc: StarletteHTTPException):
+    ctx = rl.request_ctx_var.get()
+    if ctx is not None:
+        ctx.error = f"HTTP {exc.status_code}: {exc.detail}"
+    return await http_exception_handler(request, exc)
+
+
+@app.exception_handler(RequestValidationError)
+async def _log_validation_error(request: Request, exc: RequestValidationError):
+    ctx = rl.request_ctx_var.get()
+    if ctx is not None:
+        # Field locations only: FastAPI's error detail echoes the submitted
+        # values, which here can be an entire base64-encoded document.
+        ctx.error = "validation: " + ", ".join(
+            ".".join(str(part) for part in err.get("loc", ())) for err in exc.errors()
+        )
+    return await request_validation_exception_handler(request, exc)
+
 
 # ---------------------------------------------------------------------------
 # Endpoints
@@ -848,9 +979,11 @@ async def ocr_image(
     - **raw**: If true, return raw output with grounding annotations
     - **retry**: If true, retry with different enhancements on low scores
     """
+    _note_params(prompt=prompt, raw=raw, retry=retry)
     _validate_prompt(prompt)
 
     data = await file.read()
+    _note_upload(file.filename, data)
     _check_file_size(data, MAX_IMAGE_SIZE_MB, "Image")
 
     # Load original image (without enhancement — retry system handles it)
@@ -866,25 +999,25 @@ async def ocr_image(
     # Skip blank pages entirely
     if is_blank_page(image):
         logger.info("Blank page detected — skipping OCR")
-        return JSONResponse(_skip_page_result("Blank page detected — skipped OCR", "blank_page"))
+        return _respond(_skip_page_result("Blank page detected — skipped OCR", "blank_page"))
 
     # Skip low-quality scans where content is too small to read
     if is_low_quality_scan(image):
         logger.info("Low-quality scan detected — skipping OCR")
-        return JSONResponse(_skip_page_result("Low-quality scan — content too small to read", "low_quality_scan"))
+        return _respond(_skip_page_result("Low-quality scan — content too small to read", "low_quality_scan"))
 
     if retry:
         result = await _run_inference_with_retry(image, prompt)
         if raw:
             result["text"] = result["raw_text"]
         _schedule_feedback(image, result, filename=file.filename)
-        return JSONResponse(result)
+        return _respond(result)
     else:
         enhanced = enhance_scan(image).convert("RGB")
         output = await _run_inference(enhanced, prompt)
         result = await _format_result(output, raw, image=image)
         _schedule_feedback(image, result, filename=file.filename)
-        return JSONResponse(result)
+        return _respond(result)
 
 
 @app.post("/ocr/image/base64")
@@ -895,12 +1028,14 @@ async def ocr_image_base64(
     retry: bool = Form(True),
 ):
     """OCR a single image from base64-encoded data."""
+    _note_params(prompt=prompt, raw=raw, retry=retry)
     _validate_prompt(prompt)
 
     try:
         data = base64.b64decode(image_base64)
     except Exception:
         raise HTTPException(400, "Invalid base64 data")
+    _note_upload(None, data)
 
     _check_file_size(data, MAX_IMAGE_SIZE_MB, "Image")
 
@@ -916,25 +1051,25 @@ async def ocr_image_base64(
     # Skip blank pages entirely
     if is_blank_page(image):
         logger.info("Blank page detected — skipping OCR")
-        return JSONResponse(_skip_page_result("Blank page detected — skipped OCR", "blank_page"))
+        return _respond(_skip_page_result("Blank page detected — skipped OCR", "blank_page"))
 
     # Skip low-quality scans where content is too small to read
     if is_low_quality_scan(image):
         logger.info("Low-quality scan detected — skipping OCR")
-        return JSONResponse(_skip_page_result("Low-quality scan — content too small to read", "low_quality_scan"))
+        return _respond(_skip_page_result("Low-quality scan — content too small to read", "low_quality_scan"))
 
     if retry:
         result = await _run_inference_with_retry(image, prompt)
         if raw:
             result["text"] = result["raw_text"]
         _schedule_feedback(image, result)
-        return JSONResponse(result)
+        return _respond(result)
     else:
         enhanced = enhance_scan(image).convert("RGB")
         output = await _run_inference(enhanced, prompt)
         result = await _format_result(output, raw, image=image)
         _schedule_feedback(image, result)
-        return JSONResponse(result)
+        return _respond(result)
 
 
 @app.post("/ocr/pdf")
@@ -954,9 +1089,11 @@ async def ocr_pdf(
     - **raw**: If true, return raw output with grounding annotations
     - **retry**: If true, retry low-scoring pages
     """
+    _note_params(prompt=prompt, dpi=dpi, raw=raw, retry=retry)
     _validate_prompt(prompt)
 
     pdf_bytes = await file.read()
+    _note_upload(file.filename, pdf_bytes)
     _check_file_size(pdf_bytes, MAX_PDF_SIZE_MB, "PDF")
 
     # Read page count once, before dispatching workers. A malformed or
@@ -1057,6 +1194,9 @@ async def ocr_pdf(
             pages[i] = _skip_page_result("OCR failed", "ocr_failed")
             pages[i]["page"] = i + 1
 
+    for p in pages:
+        _note_page(p, page=p["page"])
+
     full_text = "\n\n---\n\n".join(p["text"] for p in pages)
 
     # Build summary by flag color
@@ -1100,6 +1240,7 @@ async def ocr_batch(
     - **raw**: If true, return raw output
     - **retry**: If true, retry low-scoring images
     """
+    _note_params(prompt=prompt, raw=raw, retry=retry, files=len(files))
     _validate_prompt(prompt)
 
     if len(files) > MAX_BATCH_SIZE:
@@ -1117,6 +1258,7 @@ async def ocr_batch(
     for i, f in enumerate(files):
         try:
             data = await f.read()
+            _note_upload(f.filename, data)
             _check_file_size(data, MAX_IMAGE_SIZE_MB, f"File '{f.filename}'")
             try:
                 img = Image.open(io.BytesIO(data))
@@ -1206,6 +1348,13 @@ async def ocr_batch(
 
             if retry_result.get("score", {}).get("composite", 0) > results[result_pos]["score"]["composite"]:
                 results[result_pos] = retry_result
+
+    for r in results:
+        _note_page(r, index=r.get("index"))
+    ctx = rl.request_ctx_var.get()
+    if ctx is not None:
+        for e in errors:
+            ctx.pages.append({"index": e["index"], "error": str(e["error"])})
 
     # Build summary by flag color
     summary = {"green": 0, "yellow": 0, "red": 0}
