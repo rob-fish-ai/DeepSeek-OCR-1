@@ -134,7 +134,8 @@ def prepare(args):
     os.makedirs(review, exist_ok=True)
     pool = candidates(args.feedback_dir)
     picked = stratified(pool, args.n, rng)
-    print(f"{len(pool)} distinct production pages in the feedback corpus; sampling {len(picked)}")
+    print(f"{len(pool)} candidate production pages in the feedback corpus "
+          f"(duplicates removed only among the sample); sampled {len(picked)} distinct")
     index = []
     for k, p in enumerate(picked, 1):
         pid = f"r{k:03d}"

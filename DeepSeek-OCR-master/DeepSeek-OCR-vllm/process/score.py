@@ -19,7 +19,6 @@ import re
 import zlib
 from collections import Counter
 from dataclasses import dataclass, field
-from difflib import SequenceMatcher
 from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -323,6 +322,32 @@ def _measure_degeneration(text: str) -> float:
     return max(0.0, (head - tail) / head)
 
 
+_WORD = re.compile(r"[^\W_]+")
+
+
+def _token_similarity(a: str, b: str) -> float:
+    """Word-overlap similarity (F1 over word multisets), linear time.
+
+    This replaced difflib.SequenceMatcher, which failed both ways. With its
+    default autojunk it treats any character in >1% of a 200+ char string as
+    junk -- nearly every letter -- so two near-identical tables scored 0.009.
+    With autojunk=False it is correct but quadratic: one comparison of two
+    looping outputs took 4-12 seconds, the retry path makes about nine, and
+    the event loop stalled long enough for the supervisor to kill the
+    service. That caused 12 production restarts between 2026-09-14 and
+    2026-09-24. Word order is not needed here: this only ranks retry
+    attempts of the same page against each other.
+    """
+    ta = _WORD.findall(a.lower())
+    tb = _WORD.findall(b.lower())
+    if not ta and not tb:
+        return 1.0
+    if not ta or not tb:
+        return 0.0
+    common = sum((Counter(ta) & Counter(tb)).values())
+    return 2 * common / (len(ta) + len(tb))
+
+
 def _score_self_consistency(
     current: OCRResult,
     others: list[OCRResult],
@@ -341,21 +366,7 @@ def _score_self_consistency(
     if not others:
         return 1.0
 
-    similarities = []
-    for other in others:
-        # autojunk=False is essential. With the default, any character
-        # occurring in >1% of a string longer than 200 chars is treated as
-        # junk -- which is nearly every letter in real text, and catastrophic
-        # on repetitive content like table markup: two near-identical tables
-        # score 0.009 instead of 0.949. That is what crushed table-heavy
-        # pages to ~0.12 composite under the previous weighting.
-        ratio = SequenceMatcher(
-            None,
-            current.clean_text,
-            other.clean_text,
-            autojunk=False,
-        ).ratio()
-        similarities.append(ratio)
+    similarities = [_token_similarity(current.clean_text, other.clean_text) for other in others]
 
     if not similarities:
         return 1.0

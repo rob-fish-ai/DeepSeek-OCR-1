@@ -554,7 +554,11 @@ async def _format_result(inference_output: dict, raw: bool, image: Image.Image =
     text = inference_output["text"]
     num_tokens = inference_output["num_tokens"]
     stats = CleanStats()
-    cleaned = clean_output(text, stats=stats)
+    # Post-processing and scoring are CPU work over output that can be tens of
+    # thousands of characters. They run in a worker thread so a slow case
+    # delays only this request: on the event loop, a single slow scoring pass
+    # once stalled the service long enough for the supervisor to kill it.
+    cleaned = await asyncio.to_thread(clean_output, text, stats)
 
     # Score the result
     ocr_result = OCRResult(
@@ -565,7 +569,7 @@ async def _format_result(inference_output: dict, raw: bool, image: Image.Image =
         clean_stats=stats,
         hit_length_limit=inference_output.get("hit_length_limit", False),
     )
-    score = score_result(ocr_result)
+    score = await asyncio.to_thread(score_result, ocr_result)
     flag_info = compute_flags(ocr_result, SCORE_THRESHOLD)
 
     result = {
@@ -669,7 +673,7 @@ async def _run_inference_with_retry(
         text = output["text"]
         num_tokens = output["num_tokens"]
         retry_stats = CleanStats()
-        cleaned = clean_output(text, stats=retry_stats)
+        cleaned = await asyncio.to_thread(clean_output, text, retry_stats)
 
         ocr_result = OCRResult(
             raw_text=text,
@@ -685,7 +689,7 @@ async def _run_inference_with_retry(
         # instead of ~1.0.  _format_result scores without dimensions, and the
         # two composites are compared against each other by the PDF and batch
         # endpoints, so both paths must score on the same scale.
-        score_result(ocr_result, other_results=results)
+        await asyncio.to_thread(score_result, ocr_result, results)
         results.append(ocr_result)
 
         logger.info(
@@ -700,14 +704,14 @@ async def _run_inference_with_retry(
         if not needs_retry(ocr_result, SCORE_THRESHOLD):
             break
 
-    best = select_best_result(results)
+    best = await asyncio.to_thread(select_best_result, results)
 
     # select_best_result ranks candidates using cross-run self-consistency,
     # which a single first-pass result cannot have (it scores a flat 1.0).
     # Re-score the winner on a single-run basis so the composite we report —
     # and that the PDF/batch endpoints compare against the first pass — is
     # computed exactly the way _format_result computes it.
-    score_result(best)
+    await asyncio.to_thread(score_result, best)
 
     flag_info = compute_flags(best, SCORE_THRESHOLD)
 
