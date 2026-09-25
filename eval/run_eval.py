@@ -19,6 +19,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import statistics as st
 import subprocess
 import sys
@@ -32,13 +33,25 @@ sys.path.insert(0, os.path.dirname(__file__))
 from metrics import score_page  # noqa: E402
 
 FAIL_F1 = 0.5     # a page below this F1 counts as a failed page
+LENGTH_LIMIT = 7200   # num_tokens at or above this: generation was cut off (the ceiling is ~7,280)
+_REF_LABEL = re.compile(r"<\|ref\|>(.*?)<\|/ref\|>", re.S)
+_GROUNDED = re.compile(r"<\|ref\|>.*?<\|/det\|>|<｜end▁of▁sentence｜>", re.S)
+
+
+def picture_only(raw_text: str) -> bool:
+    """The model labelled the whole page a picture and emitted nothing else --
+    the most common total failure in production, since cleanup then deletes it."""
+    labels = _REF_LABEL.findall(raw_text or "")
+    return bool(labels) and set(labels) == {"image"} and not _GROUNDED.sub("", raw_text).strip()
 
 
 def run_item(item, args, data_dir, text_dir):
     with open(f"{data_dir}/{item['image']}", "rb") as f:
         png = f.read()
-    with open(f"{data_dir}/{item['gt']}", encoding="utf-8") as f:
-        gt = f.read()
+    gt = None
+    if item.get("gt"):                      # unlabeled sets profile failures without accuracy
+        with open(f"{data_dir}/{item['gt']}", encoding="utf-8") as f:
+            gt = f.read()
     rid = f"eval-{args.label}-{item['id']}"[:128]
     started = time.monotonic()
     try:
@@ -54,7 +67,7 @@ def run_item(item, args, data_dir, text_dir):
     with open(f"{text_dir}/{item['id']}.txt", "w", encoding="utf-8") as f:
         f.write(text)
     score = body.get("score") or {}
-    return {
+    row = {
         **_ident(item),
         "status": r.status_code,
         "latency_s": round(latency, 2),
@@ -64,8 +77,15 @@ def run_item(item, args, data_dir, text_dir):
         "attempts": body.get("attempts"),
         "engine": body.get("ocr_engine"),
         "codes": [d.get("code") for d in body.get("flag_details") or []],
-        **score_page(gt, text),
+        "picture_only": picture_only(body.get("raw_text", "")),
+        "hit_limit": (body.get("num_tokens") or 0) >= LENGTH_LIMIT,
+        "out_chars": len(text),
     }
+    if gt is not None:
+        row.update(score_page(gt, text))
+    else:
+        row["empty"] = not text.strip()
+    return row
 
 
 def _ident(item):
@@ -76,19 +96,27 @@ def summarize(rows):
     ok = [r for r in rows if r.get("status") == 200]
     if not ok:
         return {"n": len(rows), "errors": len(rows)}
-    return {
+    pct = lambda cond: round(100 * sum(1 for r in ok if cond(r)) / len(ok), 1)
+    out = {
         "n": len(rows),
         "errors": len(rows) - len(ok),
-        "f1": round(st.mean(r["f1"] for r in ok), 4),
-        "recall": round(st.mean(r["recall"] for r in ok), 4),
-        "precision": round(st.mean(r["precision"] for r in ok), 4),
-        "wer": round(st.mean(r["wer"] for r in ok), 4),
-        "empty_pct": round(100 * sum(r["empty"] for r in ok) / len(ok), 1),
-        "failed_pct": round(100 * sum(r["f1"] < FAIL_F1 for r in ok) / len(ok), 1),
-        "red_pct": round(100 * sum(r["flag"] == "red" for r in ok) / len(ok), 1),
+        "empty_pct": pct(lambda r: r["empty"]),
+        "picture_only_pct": pct(lambda r: r.get("picture_only")),
+        "hit_limit_pct": pct(lambda r: r.get("hit_limit")),
+        "red_pct": pct(lambda r: r["flag"] == "red"),
         "latency_s": round(st.mean(r["latency_s"] for r in ok), 2),
         "tokens": sum(r["tokens"] or 0 for r in ok),
     }
+    labeled = [r for r in ok if "f1" in r]
+    if labeled:
+        out.update({
+            "f1": round(st.mean(r["f1"] for r in labeled), 4),
+            "recall": round(st.mean(r["recall"] for r in labeled), 4),
+            "precision": round(st.mean(r["precision"] for r in labeled), 4),
+            "wer": round(st.mean(r["wer"] for r in labeled), 4),
+            "failed_pct": pct(lambda r: "f1" in r and r["f1"] < FAIL_F1),
+        })
+    return out
 
 
 def slices(rows):
@@ -100,18 +128,19 @@ def slices(rows):
 
 
 def print_table(summary):
-    print(f"\n{'slice':28s} {'n':>4} {'F1':>6} {'recall':>7} {'prec':>6} {'WER':>6} "
-          f"{'empty%':>7} {'fail%':>6} {'red%':>6} {'sec':>6}")
+    print(f"\n{'slice':28s} {'n':>4} {'F1':>6} {'WER':>6} {'fail%':>6} "
+          f"{'empty%':>7} {'pict%':>6} {'limit%':>7} {'red%':>6} {'sec':>6}")
     for name, s in summary.items():
-        if "f1" not in s:
+        if "empty_pct" not in s:
             print(f"{name:28s} {s['n']:4d}  all errored"); continue
-        print(f"{name:28s} {s['n']:4d} {s['f1']:6.3f} {s['recall']:7.3f} {s['precision']:6.3f} {s['wer']:6.3f} "
-              f"{s['empty_pct']:7.1f} {s['failed_pct']:6.1f} {s['red_pct']:6.1f} {s['latency_s']:6.1f}")
+        f1 = f"{s['f1']:6.3f} {s['wer']:6.3f} {s['failed_pct']:6.1f}" if "f1" in s else f"{'-':>6} {'-':>6} {'-':>6}"
+        print(f"{name:28s} {s['n']:4d} {f1} {s['empty_pct']:7.1f} {s['picture_only_pct']:6.1f} "
+              f"{s['hit_limit_pct']:7.1f} {s['red_pct']:6.1f} {s['latency_s']:6.1f}")
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--set", default="simulated", choices=["simulated", "real"])
+    ap.add_argument("--set", default="simulated", help="simulated, real, or any set dir with a manifest.json")
     ap.add_argument("--label", required=True, help="name for this run, e.g. baseline_a")
     ap.add_argument("--data-dir", default=os.environ.get("EVAL_DATA_DIR", "/workspace/eval_data"))
     ap.add_argument("--url", default="http://localhost:8000")

@@ -2,9 +2,14 @@
 
 Step 1 -- prepare drafts (needs the service running):
     python eval/build_real.py --prepare [--n 80]
+    python eval/build_real.py --prepare --pdf-set scanned_pdfs --per-doc 6 --prefix s
 
-  Samples real production pages from the feedback corpus, generates a draft
-  transcription for each, and writes <data-dir>/real/review/:
+  The first samples the feedback corpus; the second samples pages at random
+  from a set built by build_pdf_set.py (representative real documents). Both
+  add to the same review folder.
+
+  Either way, each sampled page gets a draft transcription in
+  <data-dir>/real/review/:
       rNNN.png   the page exactly as the service received it
       rNNN.txt   draft text, first line a DRAFT marker
   A person corrects each .txt against its image and deletes the marker line.
@@ -128,26 +133,58 @@ def draft(url, img, rid):
     return best[1], best[2]
 
 
+def from_pdf_set(args, rng):
+    """Random pages per document from a build_pdf_set.py set -- representative,
+    unlike the feedback corpus, which only holds pages that already failed."""
+    set_dir = f"{args.data_dir}/{args.pdf_set}"
+    items = json.load(open(f"{set_dir}/manifest.json"))["items"]
+    # The same scan can arrive in more than one PDF (two of the first seven
+    # were identical). Keep each distinct page once, under the first document
+    # it appears in, so nobody verifies the same page twice.
+    seen, distinct = set(), {}
+    for i in sorted(items, key=lambda i: (int(i["doc"][1:]) if i["doc"][1:].isdigit() else 0, i["page"])):
+        digest = hashlib.sha256(open(f"{set_dir}/{i['image']}", "rb").read()).hexdigest()
+        if digest not in seen:
+            seen.add(digest)
+            distinct.setdefault(i["doc"], []).append(i)
+    picked = []
+    for doc, pages in distinct.items():
+        for i in rng.sample(pages, min(args.per_doc, len(pages))):
+            picked.append({"entry": f"{args.pdf_set}/{i['id']}", "png": f"{set_dir}/{i['image']}", "score": None})
+    dropped = sorted({i["doc"] for i in items} - set(distinct))
+    print(f"sampled {len(picked)} pages ({args.per_doc} per document) from {len(distinct)} distinct documents"
+          + (f"; skipped {dropped} (duplicates of earlier documents)" if dropped else ""))
+    return picked
+
+
 def prepare(args):
     rng = random.Random(args.seed)
     review = f"{args.data_dir}/real/review"
     os.makedirs(review, exist_ok=True)
-    pool = candidates(args.feedback_dir)
-    picked = stratified(pool, args.n, rng)
-    print(f"{len(pool)} candidate production pages in the feedback corpus "
-          f"(duplicates removed only among the sample); sampled {len(picked)} distinct")
-    index = []
+    if args.pdf_set:
+        picked = from_pdf_set(args, rng)
+    else:
+        pool = candidates(args.feedback_dir)
+        picked = stratified(pool, args.n, rng)
+        print(f"{len(pool)} candidate production pages in the feedback corpus "
+              f"(duplicates removed only among the sample); sampled {len(picked)} distinct")
+    index_path = f"{args.data_dir}/real/index.json"
+    index = json.load(open(index_path)) if os.path.exists(index_path) else []
     for k, p in enumerate(picked, 1):
-        pid = f"r{k:03d}"
+        pid = f"{args.prefix}{k:03d}"
+        if os.path.exists(f"{review}/{pid}.txt"):
+            print(f"  {pid} already exists -- skipped (never overwrite a page someone may be reviewing)")
+            continue
         img = Image.open(p["png"]).convert("RGB")
         shutil.copy(p["png"], f"{review}/{pid}.png")
         text, orient = draft(args.url, img, f"eval-draft-{pid}")
         with open(f"{review}/{pid}.txt", "w", encoding="utf-8") as f:
             f.write(f"{MARKER}\n# draft read the page {orient}; correct it in normal reading order\n{text}\n")
         index.append({"id": pid, "entry": p["entry"], "stored_score": p["score"], "draft_orientation": orient})
-        print(f"  {pid}  stored score {p['score']:.3f}  draft {len(tokens(text)):4d} words  ({orient})", flush=True)
-    with open(f"{args.data_dir}/real/index.json", "w") as f:
-        json.dump(index, f, indent=1)
+        stored = f"stored score {p['score']:.3f}" if p["score"] is not None else "representative"
+        print(f"  {pid}  {stored}  draft {len(tokens(text)):4d} words  ({orient})", flush=True)
+        with open(index_path, "w") as f:           # saved as we go, so an interrupted run loses nothing
+            json.dump(index, f, indent=1)
     with open(f"{review}/README.txt", "w") as f:
         f.write(REVIEW_GUIDE)
     print(f"\nreview folder ready: {review}")
@@ -209,6 +246,9 @@ def main():
     ap.add_argument("--feedback-dir", default=os.path.join(os.path.dirname(__file__), "..", "feedback", "pending"))
     ap.add_argument("--url", default="http://localhost:8000")
     ap.add_argument("--n", type=int, default=80)
+    ap.add_argument("--pdf-set", default="", help="sample from this build_pdf_set.py set instead of feedback")
+    ap.add_argument("--per-doc", type=int, default=6)
+    ap.add_argument("--prefix", default="r", help="page id prefix: r = feedback sample, s = scanned PDFs")
     ap.add_argument("--seed", type=int, default=11)
     args = ap.parse_args()
     prepare(args) if args.prepare else freeze(args)

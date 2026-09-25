@@ -66,6 +66,23 @@ Sampled from the feedback corpus, which only holds pages that scored below
 0.70 — so it is biased toward pages the engine struggles with. Add
 representative real pages (PNG + verified TXT) to `review/` when available.
 
+### Representative real PDFs
+
+```
+python eval/build_pdf_set.py --pdf-dir /workspace/eval_data/drive --name scanned_pdfs
+python eval/run_eval.py --set scanned_pdfs --label profile        # failure rates, no labels needed
+python eval/build_real.py --prepare --pdf-set scanned_pdfs --per-doc 6 --prefix s
+```
+
+`build_pdf_set.py` renders every page as production traffic arrives (PDF
+`/Rotate` honoured, 1280×1920 frame). Documents are referred to by alias
+(`d1`, `d2`, …): source filenames are personal names and stay beside the data.
+Without ground truth, `run_eval.py` still reports the failures it can see in
+each response — empty output, picture-only pages (the whole page labelled an
+image and discarded), length-limit hits, red flags. Pages sampled with
+`--pdf-set` are de-duplicated by content, since the same scan can arrive in
+more than one PDF.
+
 ## Running and comparing
 
 ```
