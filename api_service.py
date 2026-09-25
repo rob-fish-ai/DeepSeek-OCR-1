@@ -772,8 +772,8 @@ async def _attempt(
     return result
 
 
-def _rescue_ladder(image: Image.Image, first: OCRResult, prompt_key: str) -> list[dict]:
-    """Strategies to try after a failed first attempt.
+def _rescue_ladder(image: Image.Image, first: OCRResult, prompt_key: str) -> tuple[str, list[dict]]:
+    """Returns (kind, strategies) for a failed first attempt.
 
     A page whose generation ran away (hit the length limit), or that looks
     sideways, gets strategies aimed at those causes. Measured on pages that
@@ -781,20 +781,23 @@ def _rescue_ladder(image: Image.Image, first: OCRResult, prompt_key: str) -> lis
     pages and reading the page in two halves rescued the 4th; for sideways
     pages the right rotation fixed 4 of 4. The contrast presets rescued none,
     so they remain only for pages that failed some other way.
+
+    kind is "loop" (try every strategy, keep the best), "sideways" (stop at the
+    first that reads well: only one orientation is right) or "presets".
     """
     sideways = _looks_sideways(image)
     looped = first.hit_length_limit or is_degenerate_output(first.clean_text)
     if LOOP_RESCUE and prompt_key == "document" and (looped or sideways):
         if sideways:
-            return [dict(label="rotate_270", rotate=270), dict(label="rotate_90", rotate=90),
-                    dict(label="free_ocr", prompt="free_ocr")]
+            return "sideways", [dict(label="rotate_270", rotate=270), dict(label="rotate_90", rotate=90),
+                                dict(label="free_ocr", prompt="free_ocr")]
         # The default "adaptive" enhancement itself sends some pages into a
         # loop that the same page without enhancement reads cleanly, so that is
         # tried first. Eval: dropping it regressed two pages it had rescued.
         none_preset = next(p for p in ENHANCEMENT_PRESETS if p["name"] == "none")
-        return [dict(label="none", preset=none_preset), dict(label="free_ocr", prompt="free_ocr"),
-                dict(label="split_halves", split=True)]
-    return [dict(label=p["name"], preset=p) for p in ENHANCEMENT_PRESETS[1:MAX_RETRIES]]
+        return "loop", [dict(label="none", preset=none_preset), dict(label="free_ocr", prompt="free_ocr"),
+                        dict(label="split_halves", split=True)]
+    return "presets", [dict(label=p["name"], preset=p) for p in ENHANCEMENT_PRESETS[1:MAX_RETRIES]]
 
 
 async def _run_inference_with_retry(
@@ -816,9 +819,13 @@ async def _run_inference_with_retry(
     results.append(first)
 
     if MAX_RETRIES > 1 and needs_retry(first, SCORE_THRESHOLD):
-        for step in _rescue_ladder(image, first, prompt_key):
+        kind, ladder = _rescue_ladder(image, first, prompt_key)
+        for step in ladder:
             last = results[-1]
-            if "preset" in step and (last.score.composite if last.score else 0) < HOPELESS_THRESHOLD:
+            # Only the plain preset retries give up on "hopeless" pages: a
+            # looping page whose output was stripped to nothing scores 0.10,
+            # and applying this there skipped its whole rescue.
+            if kind == "presets" and (last.score.composite if last.score else 0) < HOPELESS_THRESHOLD:
                 logger.info("Score %.3f < %.2f — skipping remaining retries",
                             last.score.composite if last.score else 0, HOPELESS_THRESHOLD)
                 break
@@ -826,7 +833,14 @@ async def _run_inference_with_retry(
                                      preset=step.get("preset"), rotate=step.get("rotate", 0),
                                      split=step.get("split", False))
             results.append(attempt)
-            if not needs_retry(attempt, SCORE_THRESHOLD):
+            # A looping page tries every strategy and keeps the best-scoring
+            # read. Stopping at the first acceptable score lost reads: an
+            # unenhanced attempt scored 0.94 with F1 0.16 (most of the page
+            # missing) while a later split read scored 0.995 with F1 0.95.
+            # Absolute scores are a poor accuracy signal, but across reads of
+            # the same page the best score picked the most accurate read in
+            # all five cases examined.
+            if kind != "loop" and not needs_retry(attempt, SCORE_THRESHOLD):
                 break
 
     best = await asyncio.to_thread(select_best_result, results)

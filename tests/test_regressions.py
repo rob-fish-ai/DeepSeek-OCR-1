@@ -207,18 +207,36 @@ def first_then(first, rest):
     return lambda n: first if n == 1 else rest
 
 
-def test_looping_page_first_retried_without_enhancement(service):
-    """The default enhancement itself sends some pages into a loop. Eval: two
-    pages rescued by the no-enhancement retry regressed when it was dropped."""
+WEAK = ("<|ref|>text<|/ref|><|det|>[[1, 1, 2, 2]]<|/det|>\nTenant income certification, part one", 40, "stop")
+
+
+def test_loop_ladder_tries_every_strategy_and_keeps_best(service):
+    """Stopping at the first acceptable score lost better reads: an unenhanced
+    read scored 0.94 at F1 0.16 while a later read scored 0.995 at F1 0.95."""
     client, install = service
-    engine = install({"document": first_then(LOOP, (GROUNDED_TEXT, 300, "stop"))})
+    # calls: 1 adaptive (loops), 2 no enhancement (weak but "acceptable"), 3 free_ocr (good), 4-5 halves (loop)
+    engine = install({"document": lambda n: WEAK if n == 2 else LOOP, "free_ocr": (PLAIN_TEXT, 240, "stop")})
 
     async def go():
         async with client() as c:
             return await post(c, page_png(), retry=True)
     r = asyncio.run(go()).json()
-    assert engine.calls == ["document", "document"]
-    assert r["preset"] == "none" and r["hit_length_limit"] is False
+    assert engine.calls == ["document", "document", "free_ocr", "document", "document"]
+    assert r["source"] == "free_ocr" and r["attempts"] == 4
+
+
+def test_hopeless_looping_page_is_still_rescued(service):
+    """A loop stripped to nothing by cleanup scores 0.10; the old 'hopeless'
+    rule then skipped the whole rescue."""
+    client, install = service
+    stripped_loop = ("<table>" + "<tr><td></td><td></td></tr>" * 1200, 7280, "length")
+    install({"document": stripped_loop, "free_ocr": (PLAIN_TEXT, 240, "stop")})
+
+    async def go():
+        async with client() as c:
+            return await post(c, page_png(), retry=True)
+    r = asyncio.run(go()).json()
+    assert r["source"] == "free_ocr" and r["flag"] != "red"
 
 
 def test_looping_page_rescued_by_free_ocr(service):
@@ -229,7 +247,7 @@ def test_looping_page_rescued_by_free_ocr(service):
         async with client() as c:
             return await post(c, page_png(), retry=True)
     r = asyncio.run(go()).json()
-    assert engine.calls == ["document", "document", "free_ocr"]
+    assert engine.calls == ["document", "document", "free_ocr", "document", "document"]
     assert r["source"] == "free_ocr" and r["hit_length_limit"] is False
     assert r["flag"] != "red"
 

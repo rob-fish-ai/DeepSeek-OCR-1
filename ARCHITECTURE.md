@@ -557,7 +557,14 @@ breakdown for exactly this purpose — entries archived before that change have
 ## Retry Logic
 
 When `retry=true` (default) and attempt 1 scores < 0.60, the retries depend on
-*how* it failed (`_rescue_ladder`). Each stops as soon as an attempt scores ≥ 0.60.
+*how* it failed (`_rescue_ladder`). A looping page tries **every** strategy and
+keeps the best-scoring read; the others stop as soon as an attempt scores ≥ 0.60.
+
+Why try every strategy on a loop: stopping at the first acceptable score lost
+better reads. An unenhanced attempt scored 0.94 with F1 0.16 (most of the page
+missing), while the later two-halves read scored 0.995 with F1 0.95. Absolute
+scores are a poor accuracy signal, but across several reads of the *same* page
+the best score picked the most accurate read in all five cases examined.
 
 | Attempt 1 failed because… | Then tries, in order |
 |---|---|
