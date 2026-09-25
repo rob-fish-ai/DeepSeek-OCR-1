@@ -64,6 +64,7 @@ from process import (
 )
 from process.image_process import DeepseekOCRProcessor
 from process.ngram_norepeat import NoRepeatNGramLogitsProcessor
+from process.score import is_degenerate_output
 from vllm import SamplingParams
 from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.engine.arg_utils import AsyncEngineArgs
@@ -782,11 +783,17 @@ def _rescue_ladder(image: Image.Image, first: OCRResult, prompt_key: str) -> lis
     so they remain only for pages that failed some other way.
     """
     sideways = _looks_sideways(image)
-    if LOOP_RESCUE and prompt_key == "document" and (first.hit_length_limit or sideways):
+    looped = first.hit_length_limit or is_degenerate_output(first.clean_text)
+    if LOOP_RESCUE and prompt_key == "document" and (looped or sideways):
         if sideways:
             return [dict(label="rotate_270", rotate=270), dict(label="rotate_90", rotate=90),
                     dict(label="free_ocr", prompt="free_ocr")]
-        return [dict(label="free_ocr", prompt="free_ocr"), dict(label="split_halves", split=True)]
+        # The default "adaptive" enhancement itself sends some pages into a
+        # loop that the same page without enhancement reads cleanly, so that is
+        # tried first. Eval: dropping it regressed two pages it had rescued.
+        none_preset = next(p for p in ENHANCEMENT_PRESETS if p["name"] == "none")
+        return [dict(label="none", preset=none_preset), dict(label="free_ocr", prompt="free_ocr"),
+                dict(label="split_halves", split=True)]
     return [dict(label=p["name"], preset=p) for p in ENHANCEMENT_PRESETS[1:MAX_RETRIES]]
 
 

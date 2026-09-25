@@ -561,15 +561,25 @@ When `retry=true` (default) and attempt 1 scores < 0.60, the retries depend on
 
 | Attempt 1 failed because… | Then tries, in order |
 |---|---|
-| It ran out of room (`finish_reason == "length"`) on an upright page | `free_ocr` prompt → the page read as two halves |
+| It looped on an upright page — ran out of room (`finish_reason == "length"`), or produced degenerate output (below) | no enhancement (`"none"` preset) → `free_ocr` prompt → the page read as two halves |
 | The page looks sideways (it ran out of room or not) | rotated 270° → rotated 90° → `free_ocr` |
 | Anything else | `"none"` preset → `"strong"` preset (contrast 1.5×, sharpness 2×) |
 
 Why: on pages that looped under every contrast preset, `free_ocr` rescued 3 of 4
 real table pages, reading the page in halves (each half needs about half the
 output budget) rescued the 4th, and the correct rotation fixed 4 of 4 sideways
-pages. The contrast presets rescued none of them. At most 4 model calls per page
-— the same order of cost as the old three presets.
+pages. The no-enhancement retry comes first because the default "adaptive"
+enhancement itself sends some pages into a loop that the same page without
+enhancement reads cleanly — the eval regressed on two such pages when it was
+left out. At most 5 model calls on a page nothing rescues (the two halves count
+as two), against 3 before; pages that read correctly first time are unaffected.
+
+**Degenerate output.** A loop can also end on its own — `8/8/8/8/…` followed by
+a stop token — and never hit the length limit. Output of 200+ words with a
+distinct-word ratio below 0.05 is treated as a loop: it gets the 0.35 loop cap,
+a `degenerate_output` warning, and the rescue ladder. Measured ratios: degenerate
+outputs 0.004–0.072, lowest correct output (F1 ≥ 0.8) 0.115, lowest of 220 real
+scanned-page outputs 0.254.
 
 "Looks sideways" is a cheap ink-profile test, consulted only for pages that
 already failed, and only to order the attempts: on labelled pages it was right
@@ -799,6 +809,8 @@ returned text was cut off by the output budget, so the end of the page is missin
 | `low_quality_scan` | critical | Content too small, skipped (only with `SKIP_LOW_QUALITY_SCANS=true`) |
 | `possible_hallucination` | warning | >75% of output removed |
 | `max_tokens_hit` | warning | Stuck generation loop |
+| `degenerate_output` | warning | Loop that ended on its own: a few words repeated |
+| `truncated_output` | warning | Hit the output budget; end of page missing |
 | `repetitive_content` | info | Repetitive patterns detected |
 | `sparse_content` | info | Very little text vs image size |
 | `low_content` | info | Less than 30 chars extracted |

@@ -348,6 +348,21 @@ def _measure_degeneration(text: str, ref_is_content: bool = False) -> float:
 _WORD = re.compile(r"[^\W_]+")
 
 
+# A loop that ends on its own ("8/8/8/8/..." then a stop token) never hits the
+# length limit, so the length-gated loop cap misses it and it used to score
+# green. Measured distinct-word ratios on outputs of 200+ words: degenerate
+# outputs 0.004-0.072; lowest correct output (F1 >= 0.8) 0.115; lowest of 220
+# real scanned-page outputs 0.254. 0.05 sits well below anything real.
+_DEGENERATE_MIN_WORDS = 200
+_DEGENERATE_DISTINCT_RATIO = 0.05
+
+
+def is_degenerate_output(text: str) -> bool:
+    """Long output made of almost no distinct words: a generation loop."""
+    words = _WORD.findall(text.lower())
+    return len(words) >= _DEGENERATE_MIN_WORDS and len(set(words)) / len(words) < _DEGENERATE_DISTINCT_RATIO
+
+
 def _token_similarity(a: str, b: str) -> float:
     """Word-overlap similarity (F1 over word multisets), linear time.
 
@@ -471,6 +486,8 @@ def _apply_composite(
         _measure_degeneration(result.raw_text, result.ref_is_content) > _LOOP_DEGENERATION_THRESHOLD
         or _compression_ratio(result.raw_text, result.ref_is_content) < _LOOP_COMPRESSION_THRESHOLD
     ):
+        composite = min(composite, _LOOP_COMPOSITE_CAP)
+    elif is_degenerate_output(result.clean_text):
         composite = min(composite, _LOOP_COMPOSITE_CAP)
 
     return composite
@@ -653,6 +670,15 @@ def compute_flags(
             "code": "truncated_output",
             "severity": "warning",
             "message": "Generation hit the length limit — the end of the page is missing.",
+        })
+        has_warning = True
+
+    # A loop that stopped on its own: almost no distinct words.
+    if is_degenerate_output(result.clean_text):
+        details.append({
+            "code": "degenerate_output",
+            "severity": "warning",
+            "message": "Output repeats a handful of words over and over -- a generation loop, not page text.",
         })
         has_warning = True
 

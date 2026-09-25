@@ -207,6 +207,20 @@ def first_then(first, rest):
     return lambda n: first if n == 1 else rest
 
 
+def test_looping_page_first_retried_without_enhancement(service):
+    """The default enhancement itself sends some pages into a loop. Eval: two
+    pages rescued by the no-enhancement retry regressed when it was dropped."""
+    client, install = service
+    engine = install({"document": first_then(LOOP, (GROUNDED_TEXT, 300, "stop"))})
+
+    async def go():
+        async with client() as c:
+            return await post(c, page_png(), retry=True)
+    r = asyncio.run(go()).json()
+    assert engine.calls == ["document", "document"]
+    assert r["preset"] == "none" and r["hit_length_limit"] is False
+
+
 def test_looping_page_rescued_by_free_ocr(service):
     client, install = service
     engine = install({"document": LOOP, "free_ocr": (PLAIN_TEXT, 240, "stop")})
@@ -215,20 +229,21 @@ def test_looping_page_rescued_by_free_ocr(service):
         async with client() as c:
             return await post(c, page_png(), retry=True)
     r = asyncio.run(go()).json()
-    assert engine.calls == ["document", "free_ocr"]
+    assert engine.calls == ["document", "document", "free_ocr"]
     assert r["source"] == "free_ocr" and r["hit_length_limit"] is False
     assert r["flag"] != "red"
 
 
 def test_looping_page_rescued_by_split_when_free_ocr_also_loops(service):
     client, install = service
-    engine = install({"document": first_then(LOOP, (GROUNDED_TEXT, 300, "stop")), "free_ocr": LOOP})
+    # calls: 1 adaptive, 2 no-enhancement, 3 free_ocr, 4-5 the two halves
+    engine = install({"document": lambda n: LOOP if n <= 2 else (GROUNDED_TEXT, 300, "stop"), "free_ocr": LOOP})
 
     async def go():
         async with client() as c:
             return await post(c, page_png(), retry=True)
     r = asyncio.run(go()).json()
-    assert engine.calls == ["document", "free_ocr", "document", "document"]   # last two: the halves
+    assert engine.calls == ["document", "document", "free_ocr", "document", "document"]
     assert r["source"] == "document+split" and r["hit_length_limit"] is False
 
 
@@ -267,3 +282,35 @@ def test_max_retries_zero_does_not_crash(service, monkeypatch):
         async with client() as c:
             return await post(c, page_png(), retry=True)
     assert asyncio.run(go()).status_code == 200
+
+
+# --- loops that stop on their own ------------------------------------------------------
+
+DEGENERATE = ("8/8/8/8/8/8/8/8/8/8/8 \n\n" * 30, 900, "stop")    # ended with a stop token
+
+
+def test_loop_that_stops_on_its_own_is_not_green():
+    text = DEGENERATE[0]
+    r = OCRResult(raw_text=text, clean_text=text, num_tokens=900, max_tokens=8192, clean_stats=CleanStats())
+    score_result(r)
+    assert r.score.composite <= 0.35
+    assert "degenerate_output" in [d["code"] for d in compute_flags(r)["details"]]
+
+
+def test_repetitive_but_real_form_is_not_degenerate():
+    """Forms repeat labels. Lowest real output measured: 0.254 distinct-word ratio."""
+    from process.score import is_degenerate_output
+    rows = "".join(f"Name: ____ Date of birth: ____ Relationship: ____ Income source {i}: ____\n" for i in range(60))
+    assert not is_degenerate_output(rows)
+
+
+def test_degenerate_sideways_page_gets_rotated(service):
+    client, install = service
+    engine = install({"document": first_then(DEGENERATE, (GROUNDED_TEXT, 300, "stop"))})
+
+    async def go():
+        async with client() as c:
+            return await post(c, sideways_png(), retry=True)
+    r = asyncio.run(go()).json()
+    assert engine.calls == ["document", "document"]
+    assert r["rotation"] == 270 and "8/8/8" not in r["text"]
