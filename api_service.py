@@ -110,6 +110,23 @@ REQUEST_TIMEOUT_S = int(os.environ.get("REQUEST_TIMEOUT_S", "120"))
 SCORE_THRESHOLD = float(os.environ.get("SCORE_THRESHOLD", str(DEFAULT_THRESHOLD)))
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", str(DEFAULT_MAX_RETRIES)))
 
+# In "document" mode the model sometimes labels an entire page as one picture
+# and emits nothing else, which cleanup then discards: empty text. The page is
+# then re-read with the "free_ocr" prompt, which has no layout pass to make that
+# mistake. Measured: it recovered 12 of 12 such pages. It is a fallback only --
+# as the default prompt, free_ocr scored lower on forms and tables.
+FALLBACK_FREE_OCR = os.environ.get("FALLBACK_FREE_OCR", "true").lower() == "true"
+
+# Pages whose content covers under 12% of the page used to be skipped unread as
+# "low-quality scans". That silently dropped every cover page, chapter divider
+# and short closing page, and small ID cards photographed on a full page. They
+# are now read like any other page; set true to restore the old skip.
+SKIP_LOW_QUALITY_SCANS = os.environ.get("SKIP_LOW_QUALITY_SCANS", "false").lower() == "true"
+
+# Retry pages whose generation ran away, or that look sideways, with free_ocr,
+# a two-halves read, or rotation instead of contrast presets (see _rescue_ladder).
+LOOP_RESCUE = os.environ.get("LOOP_RESCUE", "true").lower() == "true"
+
 
 
 # Feedback storage
@@ -235,7 +252,6 @@ _BOILERPLATE_PATTERNS = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
-POST_OCR_BLANK_CHAR_LIMIT = int(os.environ.get("POST_OCR_BLANK_CHAR_LIMIT", "20"))
 
 
 def _is_boilerplate_only(text: str) -> bool:
@@ -249,14 +265,24 @@ def _is_boilerplate_only(text: str) -> bool:
 
 
 def _is_post_ocr_blank(clean_text: str) -> bool:
-    """Return True if OCR output indicates a blank/near-blank page.
+    """Return True if OCR output indicates a blank page: nothing, or only
+    boilerplate such as a page number.
 
-    Checks: text shorter than threshold OR only boilerplate content.
+    Short real text is not blank. A 20-character floor used to be applied here,
+    which marked correct output from sparse pages ("Sincerely, Jane Smith")
+    as a blank page.
     """
-    stripped = clean_text.strip()
-    if len(stripped) < POST_OCR_BLANK_CHAR_LIMIT:
-        return True
-    return _is_boilerplate_only(stripped)
+    return _is_boilerplate_only(clean_text.strip())
+
+
+_REF_LABEL = re.compile(r"<\|ref\|>(.*?)<\|/ref\|>", re.S)
+_GROUNDED = re.compile(r"<\|ref\|>.*?<\|/det\|>|<｜end▁of▁sentence｜>", re.S)
+
+
+def _picture_only(raw_text: str) -> bool:
+    """The model labelled the whole page as one picture and emitted nothing else."""
+    labels = _REF_LABEL.findall(raw_text or "")
+    return bool(labels) and set(labels) == {"image"} and not _GROUNDED.sub("", raw_text).strip()
 
 
 def _skip_page_result(reason: str, flag_detail: str) -> dict:
@@ -283,6 +309,9 @@ def _skip_page_result(reason: str, flag_detail: str) -> dict:
         "preset": None,
         "needs_external_ocr": False,
         "ocr_engine": "skipped",
+        "source": "skipped",
+        "rotation": 0,
+        "hit_length_limit": False,
     }
 
 
@@ -447,7 +476,7 @@ def _render_page_chunk(pdf_bytes: bytes, dpi: int, page_indices: list[int]):
 
             if is_blank_page(original):
                 results.append((idx, original, None, "blank_page"))
-            elif is_low_quality_scan(original):
+            elif SKIP_LOW_QUALITY_SCANS and is_low_quality_scan(original):
                 results.append((idx, original, None, "low_quality_scan"))
             else:
                 enhanced = enhance_scan(original).convert("RGB")
@@ -541,11 +570,19 @@ async def _run_inference(image: Image.Image, prompt_key: str = DEFAULT_PROMPT) -
     # emitting a stop token. This cannot be inferred from num_tokens, because
     # the usable budget is MAX_MODEL_LEN minus the prompt (~7,280 tokens for a
     # 144-DPI A4 page) and MAX_TOKENS is never reachable.
+    if FALLBACK_FREE_OCR and prompt_key == "document" and _picture_only(text):
+        logger.info("Whole page read as a single picture region; re-reading with free_ocr")
+        fallback = await _run_inference(image, "free_ocr")
+        fallback["source"] = "free_ocr_fallback"
+        return fallback
+
     return {
         "text": text,
         "num_tokens": num_tokens,
         "prompt_tokens": prompt_tokens,
         "hit_length_limit": hit_length_limit,
+        "prompt_used": prompt_key,
+        "source": prompt_key,
     }
 
 
@@ -558,7 +595,8 @@ async def _format_result(inference_output: dict, raw: bool, image: Image.Image =
     # thousands of characters. They run in a worker thread so a slow case
     # delays only this request: on the event loop, a single slow scoring pass
     # once stalled the service long enough for the supervisor to kill it.
-    cleaned = await asyncio.to_thread(clean_output, text, stats)
+    ref_is_content = inference_output.get("prompt_used") == "ocr"
+    cleaned = await asyncio.to_thread(clean_output, text, stats, ref_is_content)
 
     # Score the result
     ocr_result = OCRResult(
@@ -568,6 +606,9 @@ async def _format_result(inference_output: dict, raw: bool, image: Image.Image =
         max_tokens=MAX_TOKENS,
         clean_stats=stats,
         hit_length_limit=inference_output.get("hit_length_limit", False),
+        ref_is_content=ref_is_content,
+        sparse_page=image is not None and is_low_quality_scan(image),
+        source=inference_output.get("source", "document"),
     )
     score = await asyncio.to_thread(score_result, ocr_result)
     flag_info = compute_flags(ocr_result, SCORE_THRESHOLD)
@@ -582,6 +623,9 @@ async def _format_result(inference_output: dict, raw: bool, image: Image.Image =
         "flag_details": flag_info["details"],
         "needs_external_ocr": False,
         "ocr_engine": "deepseek",
+        "source": ocr_result.source,
+        "rotation": 0,
+        "hit_length_limit": ocr_result.hit_length_limit,
     }
 
     # Post-OCR blank page detection: only flag as blank if the image itself
@@ -635,74 +679,148 @@ async def _format_result(inference_output: dict, raw: bool, image: Image.Image =
     return result
 
 
+def _looks_sideways(image: Image.Image) -> bool:
+    """True if the page's text appears to run vertically.
+
+    Horizontal text lines make the ink profile alternate row by row; on a
+    sideways page it alternates column by column instead. Cheap, and only
+    used to ORDER rescue attempts for a page that already failed -- on
+    upright pages that read fine it is never consulted. On labelled pages it
+    was right 8/8; across the failure corpus about half its sideways calls
+    were really sparse pages or ID cards, which costs extra attempts, not
+    correctness.
+    """
+    im = image.convert("L")
+    im.thumbnail((1200, 1200))
+    ink = (np.asarray(im) < 160).astype(np.float32)
+
+    def lineness(profile):
+        p = np.convolve(profile, np.ones(3) / 3, mode="same")
+        return np.abs(np.diff(p)).mean() / (p.mean() + 1e-6)
+
+    return lineness(ink.mean(axis=1)) < lineness(ink.mean(axis=0))
+
+
+def _split_page(image: Image.Image) -> tuple[Image.Image, Image.Image]:
+    """Top and bottom halves, cut at the emptiest row near the middle so no
+    text line is sliced. Each half needs roughly half the output budget."""
+    g = np.asarray(image.convert("L"))
+    h = g.shape[0]
+    band = range(int(h * 0.40), int(h * 0.60))
+    y = band.start + int(np.argmin([(g[r] < 200).sum() for r in band]))
+    return image.crop((0, 0, image.width, y)), image.crop((0, y, image.width, h))
+
+
+async def _attempt(
+    image: Image.Image,
+    prompt_key: str,
+    label: str,
+    previous: list[OCRResult],
+    sparse_page: bool,
+    preset: Optional[dict] = None,
+    rotate: int = 0,
+    split: bool = False,
+) -> OCRResult:
+    """One scored OCR attempt under a given strategy."""
+    img = image.rotate(rotate, expand=True) if rotate else image
+    if preset is None or preset["contrast"] is None:
+        enhanced = enhance_scan(img)
+    else:
+        enhanced = enhance_scan_with_preset(img, preset["contrast"], preset["sharpness"])
+    enhanced = enhanced.convert("RGB")
+
+    if split:
+        top, bottom = _split_page(enhanced)
+        a = await _run_inference(top, prompt_key)
+        b = await _run_inference(bottom, prompt_key)
+        output = {
+            "text": a["text"] + "\n\n" + b["text"],
+            "num_tokens": a["num_tokens"] + b["num_tokens"],
+            "hit_length_limit": a["hit_length_limit"] or b["hit_length_limit"],
+            "prompt_used": a.get("prompt_used"),
+            "source": f"{a.get('source', prompt_key)}+split",
+        }
+    else:
+        output = await _run_inference(enhanced, prompt_key)
+
+    stats = CleanStats()
+    ref_is_content = output.get("prompt_used") == "ocr"
+    cleaned = await asyncio.to_thread(clean_output, output["text"], stats, ref_is_content)
+    result = OCRResult(
+        raw_text=output["text"],
+        clean_text=cleaned,
+        num_tokens=output["num_tokens"],
+        max_tokens=MAX_TOKENS,
+        preset_name=label,
+        clean_stats=stats,
+        hit_length_limit=output.get("hit_length_limit", False),
+        ref_is_content=ref_is_content,
+        sparse_page=sparse_page,
+        source=output.get("source", prompt_key),
+        rotation=rotate,
+    )
+    # No image dimensions here: _score_content_density switches to a
+    # pixel-ratio scale when given them, which scores a normal page ~0.26
+    # instead of ~1.0.  _format_result scores without dimensions, and the
+    # two composites are compared against each other by the PDF and batch
+    # endpoints, so both paths must score on the same scale.
+    await asyncio.to_thread(score_result, result, previous)
+    logger.info("Attempt %d (%s): %d tokens%s, score=%.3f", len(previous) + 1, label,
+                result.num_tokens, ", hit length limit" if result.hit_length_limit else "",
+                result.score.composite)
+    return result
+
+
+def _rescue_ladder(image: Image.Image, first: OCRResult, prompt_key: str) -> list[dict]:
+    """Strategies to try after a failed first attempt.
+
+    A page whose generation ran away (hit the length limit), or that looks
+    sideways, gets strategies aimed at those causes. Measured on pages that
+    looped under every contrast preset: free_ocr rescued 3 of 4 real table
+    pages and reading the page in two halves rescued the 4th; for sideways
+    pages the right rotation fixed 4 of 4. The contrast presets rescued none,
+    so they remain only for pages that failed some other way.
+    """
+    sideways = _looks_sideways(image)
+    if LOOP_RESCUE and prompt_key == "document" and (first.hit_length_limit or sideways):
+        if sideways:
+            return [dict(label="rotate_270", rotate=270), dict(label="rotate_90", rotate=90),
+                    dict(label="free_ocr", prompt="free_ocr")]
+        return [dict(label="free_ocr", prompt="free_ocr"), dict(label="split_halves", split=True)]
+    return [dict(label=p["name"], preset=p) for p in ENHANCEMENT_PRESETS[1:MAX_RETRIES]]
+
+
 async def _run_inference_with_retry(
     image: Image.Image,
     prompt_key: str,
 ) -> dict:
-    """Run OCR with scoring and retry on low-quality results.
+    """Run OCR with scoring, retrying failed pages with targeted strategies.
 
-    Tries different enhancement presets and returns the best-scoring result.
+    Returns the best-scoring attempt.
     """
     results: list[OCRResult] = []
+    sparse_page = is_low_quality_scan(image)
 
-    # Score below which retrying is pointless — the page needs external OCR
+    # Below this, contrast presets are pointless — the page needs external OCR
     HOPELESS_THRESHOLD = 0.20
 
-    for attempt, preset in enumerate(ENHANCEMENT_PRESETS):
-        if attempt > 0 and results:
-            last_score = results[-1].score.composite if results[-1].score else 0
-            if not needs_retry(results[-1], SCORE_THRESHOLD):
-                break  # previous result was good enough
-            if last_score < HOPELESS_THRESHOLD:
-                logger.info("Score %.3f < %.2f — skipping remaining retries", last_score, HOPELESS_THRESHOLD)
-                break  # clearly hopeless, don't waste time
-        if attempt >= MAX_RETRIES:
-            break
+    first = await _attempt(image, prompt_key, ENHANCEMENT_PRESETS[0]["name"], results, sparse_page,
+                           preset=ENHANCEMENT_PRESETS[0])
+    results.append(first)
 
-        # Apply enhancement preset
-        if preset["contrast"] is None:
-            enhanced = enhance_scan(image)
-        else:
-            enhanced = enhance_scan_with_preset(
-                image, preset["contrast"], preset["sharpness"]
-            )
-        enhanced = enhanced.convert("RGB")
-
-        output = await _run_inference(enhanced, prompt_key)
-
-        text = output["text"]
-        num_tokens = output["num_tokens"]
-        retry_stats = CleanStats()
-        cleaned = await asyncio.to_thread(clean_output, text, retry_stats)
-
-        ocr_result = OCRResult(
-            raw_text=text,
-            clean_text=cleaned,
-            num_tokens=num_tokens,
-            max_tokens=MAX_TOKENS,
-            preset_name=preset["name"],
-            clean_stats=retry_stats,
-            hit_length_limit=output.get("hit_length_limit", False),
-        )
-        # No image dimensions here: _score_content_density switches to a
-        # pixel-ratio scale when given them, which scores a normal page ~0.26
-        # instead of ~1.0.  _format_result scores without dimensions, and the
-        # two composites are compared against each other by the PDF and batch
-        # endpoints, so both paths must score on the same scale.
-        await asyncio.to_thread(score_result, ocr_result, results)
-        results.append(ocr_result)
-
-        logger.info(
-            "Attempt %d/%d (preset=%s): %d tokens, score=%.3f",
-            attempt + 1,
-            MAX_RETRIES,
-            preset["name"],
-            num_tokens,
-            ocr_result.score.composite,
-        )
-
-        if not needs_retry(ocr_result, SCORE_THRESHOLD):
-            break
+    if MAX_RETRIES > 1 and needs_retry(first, SCORE_THRESHOLD):
+        for step in _rescue_ladder(image, first, prompt_key):
+            last = results[-1]
+            if "preset" in step and (last.score.composite if last.score else 0) < HOPELESS_THRESHOLD:
+                logger.info("Score %.3f < %.2f — skipping remaining retries",
+                            last.score.composite if last.score else 0, HOPELESS_THRESHOLD)
+                break
+            attempt = await _attempt(image, step.get("prompt", prompt_key), step["label"], results, sparse_page,
+                                     preset=step.get("preset"), rotate=step.get("rotate", 0),
+                                     split=step.get("split", False))
+            results.append(attempt)
+            if not needs_retry(attempt, SCORE_THRESHOLD):
+                break
 
     best = await asyncio.to_thread(select_best_result, results)
 
@@ -727,6 +845,9 @@ async def _run_inference_with_retry(
         "preset": best.preset_name,
         "needs_external_ocr": False,
         "ocr_engine": "deepseek",
+        "source": best.source,
+        "rotation": best.rotation,
+        "hit_length_limit": best.hit_length_limit,
     }
 
     # Post-OCR blank page detection: only flag as blank if the image itself
@@ -1009,8 +1130,9 @@ async def ocr_image(
         logger.info("Blank page detected — skipping OCR")
         return _respond(_skip_page_result("Blank page detected — skipped OCR", "blank_page"))
 
-    # Skip low-quality scans where content is too small to read
-    if is_low_quality_scan(image):
+    # Skip low-quality scans where content is too small to read (off by default:
+    # this dropped cover pages, dividers and short closing pages unread)
+    if SKIP_LOW_QUALITY_SCANS and is_low_quality_scan(image):
         logger.info("Low-quality scan detected — skipping OCR")
         return _respond(_skip_page_result("Low-quality scan — content too small to read", "low_quality_scan"))
 
@@ -1061,8 +1183,9 @@ async def ocr_image_base64(
         logger.info("Blank page detected — skipping OCR")
         return _respond(_skip_page_result("Blank page detected — skipped OCR", "blank_page"))
 
-    # Skip low-quality scans where content is too small to read
-    if is_low_quality_scan(image):
+    # Skip low-quality scans where content is too small to read (off by default:
+    # this dropped cover pages, dividers and short closing pages unread)
+    if SKIP_LOW_QUALITY_SCANS and is_low_quality_scan(image):
         logger.info("Low-quality scan detected — skipping OCR")
         return _respond(_skip_page_result("Low-quality scan — content too small to read", "low_quality_scan"))
 
@@ -1298,7 +1421,7 @@ async def ocr_batch(
         original_idx = valid_indices[j]
         if is_blank_page(img_raw):
             skip_type = "blank_page"
-        elif is_low_quality_scan(img_raw):
+        elif SKIP_LOW_QUALITY_SCANS and is_low_quality_scan(img_raw):
             skip_type = "low_quality_scan"
         else:
             skip_type = None

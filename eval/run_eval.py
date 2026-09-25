@@ -78,7 +78,11 @@ def run_item(item, args, data_dir, text_dir):
         "engine": body.get("ocr_engine"),
         "codes": [d.get("code") for d in body.get("flag_details") or []],
         "picture_only": picture_only(body.get("raw_text", "")),
-        "hit_limit": (body.get("num_tokens") or 0) >= LENGTH_LIMIT,
+        # Reported by the service since the retry rework; older versions did not,
+        # and a split read's summed token count cannot stand in for it.
+        "hit_limit": body.get("hit_length_limit", (body.get("num_tokens") or 0) >= LENGTH_LIMIT),
+        "source": body.get("source"),
+        "rotation": body.get("rotation"),
         "out_chars": len(text),
     }
     if gt is not None:

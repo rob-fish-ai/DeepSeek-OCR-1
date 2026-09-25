@@ -72,31 +72,28 @@ A single `/ocr/image` request with `retry=true` follows this path:
    ├── Validate file size (≤ 20 MB)
    └── Decode image (PIL) + EXIF correction
 
-2. Pre-flight checks (~1ms)
-   ├── Blank page? → RED flag, skip OCR, return immediately
-   └── Low-quality scan? → RED flag, skip OCR, return immediately
+2. Pre-flight check (~1ms)
+   └── Blank page? → RED flag, skip OCR, return immediately
+       (sparse pages are NOT skipped -- see Pre-flight Detection)
 
-3. Retry loop (up to 3 attempts)
-   │
-   ├── Attempt 1: "adaptive" preset
-   │   ├── Enhance image (adaptive contrast/sharpness for grayscale scans)
-   │   ├── Tile image into 640×640 crops (2-9 tiles)
-   │   ├── Tokenize tiles → vLLM multi-modal input
-   │   ├── AsyncLLMEngine.generate() → raw text + token count
-   │   ├── Post-process: strip grounding tags, clean tables, collapse
-   │   │   repetition, deduplicate sections, normalize whitespace
-   │   ├── Score (6 weighted metrics → composite 0.0-1.0)
-   │   └── Score ≥ 0.60? → STOP, use this result
-   │
-   ├── Attempt 2: "none" preset (no enhancement)
-   │   └── Same pipeline → score → ≥ 0.60? → STOP
-   │
-   └── Attempt 3: "strong" preset (contrast 1.5×, sharpness 2×)
-       └── Same pipeline → score → select best of all 3
+3. Attempt 1: "adaptive" preset
+   ├── Enhance image (adaptive contrast/sharpness for grayscale scans)
+   ├── Tile image into 640×640 crops (2-9 tiles)
+   ├── Tokenize tiles → vLLM multi-modal input
+   ├── AsyncLLMEngine.generate() → raw text + token count
+   │   └── Whole page labelled one picture? → re-read with free_ocr
+   ├── Post-process: strip grounding tags, clean tables, collapse
+   │   repetition, deduplicate sections, normalize whitespace
+   ├── Score (weighted metrics → composite 0.0-1.0)
+   └── Score ≥ 0.60? → STOP, use this result
 
-4. Best result selected (highest composite score)
+4. Retries, chosen by how attempt 1 failed (see Retry Logic)
+   ├── Ran out of room, or page looks sideways → rescue ladder
+   └── Otherwise → "none" and "strong" contrast presets
 
-5. Flag assignment
+5. Best result selected (highest composite score)
+
+6. Flag assignment
    ├── GREEN (≥ 0.70): Good quality
    ├── YELLOW (0.50-0.69): Spot-check recommended
    └── RED (< 0.50): Manual review required
@@ -559,28 +556,33 @@ breakdown for exactly this purpose — entries archived before that change have
 
 ## Retry Logic
 
-When `retry=true` (default) and score < 0.60:
+When `retry=true` (default) and attempt 1 scores < 0.60, the retries depend on
+*how* it failed (`_rescue_ladder`). Each stops as soon as an attempt scores ≥ 0.60.
 
-```
-┌───────────────────────────────────────────────────────────────┐
-│ Attempt 1: "adaptive"                                         │
-│  ├── Auto contrast/sharpness for grayscale scans              │
-│  ├── Score result                                             │
-│  └── Score ≥ 0.60? ──── YES ──── ▶ STOP (use this result)    │
-│                           NO                                   │
-│                           │                                    │
-│ Attempt 2: "none"         ▼                                   │
-│  ├── No enhancement (raw image)                               │
-│  ├── Score result                                             │
-│  └── Score ≥ 0.60? ──── YES ──── ▶ STOP (use this result)    │
-│                           NO                                   │
-│                           │                                    │
-│ Attempt 3: "strong"       ▼                                   │
-│  ├── Contrast 1.5×, Sharpness 2×                              │
-│  ├── Score result                                             │
-│  └── Select BEST of all 3 attempts (highest composite)        │
-└───────────────────────────────────────────────────────────────┘
-```
+| Attempt 1 failed because… | Then tries, in order |
+|---|---|
+| It ran out of room (`finish_reason == "length"`) on an upright page | `free_ocr` prompt → the page read as two halves |
+| The page looks sideways (it ran out of room or not) | rotated 270° → rotated 90° → `free_ocr` |
+| Anything else | `"none"` preset → `"strong"` preset (contrast 1.5×, sharpness 2×) |
+
+Why: on pages that looped under every contrast preset, `free_ocr` rescued 3 of 4
+real table pages, reading the page in halves (each half needs about half the
+output budget) rescued the 4th, and the correct rotation fixed 4 of 4 sideways
+pages. The contrast presets rescued none of them. At most 4 model calls per page
+— the same order of cost as the old three presets.
+
+"Looks sideways" is a cheap ink-profile test, consulted only for pages that
+already failed, and only to order the attempts: on labelled pages it was right
+8/8; across the failure corpus about half its calls were really sparse pages or
+ID cards, which costs extra attempts, not correctness. Both rotations are tried
+because both occur in production. Disable the ladder with `LOOP_RESCUE=false`.
+
+Separately, whenever the model labels an entire page as one picture region and
+emits nothing else — which cleanup then discards, leaving empty text — the page
+is immediately re-read with `free_ocr` (`FALLBACK_FREE_OCR`, default on). It
+recovered 12 of 12 such pages. `free_ocr` is a fallback only: as the default
+prompt it scored lower on forms and tables (F1 0.702 vs 0.731 on the simulated
+set, 66 pages worse against 31 better).
 
 After all attempts, `select_best_result()` re-scores `self_consistency` using the full result set and picks the highest composite.
 
@@ -588,7 +590,7 @@ After all attempts, `select_best_result()` re-scores `self_consistency` using th
 
 ## Pre-flight Detection
 
-Two instant checks (~1ms) run before any OCR processing:
+One instant check (~1ms) runs before any OCR processing:
 
 ### Blank Page Detection
 
@@ -612,8 +614,17 @@ def is_low_quality_scan(image):
     return content_area_ratio < 0.12  # Content too small
 ```
 
-Catches: faxed documents, thumbnail-quality scans, shrunken copies.
-Result: RED flag, `low_quality_scan` detail, zero text, `ocr_engine: "skipped"`.
+**No longer skips pages by default** (`SKIP_LOW_QUALITY_SCANS=false`). The
+12% content-area test was meant for shrunken or thumbnail scans, but it also
+matched every cover page, chapter divider and short closing page, and small ID
+cards photographed on a full page — all returned as empty text. Such pages are
+now read normally. The same test now marks them `sparse_page` for scoring, so a
+short correct answer ("Annual Report 2025") is neither capped at 0.30 nor
+flagged red. Empty output from a sparse page is still red.
+
+A post-OCR "blank page" verdict now needs empty or boilerplate-only output (a
+page number, a divider). It used to fire on any output under 20 characters,
+which marked correct short text as blank.
 
 ---
 
@@ -764,9 +775,18 @@ All OCR endpoints return:
   "attempts": 1,
   "preset": "adaptive",
   "ocr_engine": "deepseek",
-  "needs_external_ocr": false
+  "needs_external_ocr": false,
+  "source": "document",
+  "rotation": 0,
+  "hit_length_limit": false
 }
 ```
+
+`source` is how the returned text was produced: the prompt used (`document`,
+`free_ocr`, …), `free_ocr_fallback` for a page first read as a single picture,
+a `+split` suffix for a page read in two halves, or `skipped`. `rotation` is the
+counter-clockwise turn applied before reading. `hit_length_limit` means the
+returned text was cut off by the output budget, so the end of the page is missing.
 
 ### Flag Detail Codes
 
@@ -776,7 +796,7 @@ All OCR endpoints return:
 | `ocr_failed` | critical | Page has content but model couldn't read it |
 | `incomplete_extraction` | critical | Model hit token limit, >90% hallucinated |
 | `blank_page` | critical | Blank page skipped |
-| `low_quality_scan` | critical | Content too small, skipped |
+| `low_quality_scan` | critical | Content too small, skipped (only with `SKIP_LOW_QUALITY_SCANS=true`) |
 | `possible_hallucination` | warning | >75% of output removed |
 | `max_tokens_hit` | warning | Stuck generation loop |
 | `repetitive_content` | info | Repetitive patterns detected |
@@ -803,7 +823,10 @@ All OCR endpoints return:
 | `MAX_BATCH_SIZE` | `16` | Max images per batch request |
 | `REQUEST_TIMEOUT_S` | `120` | Request timeout (seconds) |
 | `SCORE_THRESHOLD` | `0.60` | Score below this triggers retry |
-| `MAX_RETRIES` | `3` | Max retry attempts per page |
+| `MAX_RETRIES` | `3` | Attempts per page with contrast presets (the rescue ladder has its own fixed steps) |
+| `FALLBACK_FREE_OCR` | `true` | Re-read a page labelled as one picture with `free_ocr` |
+| `LOOP_RESCUE` | `true` | Rescue ladder for runaway or sideways pages |
+| `SKIP_LOW_QUALITY_SCANS` | `false` | Restore the old skip of pages with little content |
 | `FEEDBACK_DIR` | `./feedback` | Feedback storage path |
 | `FEEDBACK_ENABLED` | `true` | Enable feedback storage |
 | `FEEDBACK_SCORE_THRESHOLD` | `0.70` | Save results below this score |

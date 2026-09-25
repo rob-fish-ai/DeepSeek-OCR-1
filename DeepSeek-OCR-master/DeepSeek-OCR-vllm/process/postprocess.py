@@ -380,7 +380,7 @@ def _deduplicate_sections(text: str, stats: CleanStats | None = None) -> str:
 # Public API
 # ---------------------------------------------------------------------------
 
-def clean_output(text: str, stats: CleanStats | None = None) -> str:
+def clean_output(text: str, stats: CleanStats | None = None, ref_is_content: bool = False) -> str:
     """Remove grounding annotations and clean up the OCR output.
 
     This is the main entry point for post-processing. It applies all
@@ -393,8 +393,15 @@ def clean_output(text: str, stats: CleanStats | None = None) -> str:
     """
     text = text.replace("<\uff5cend\u2581of\u2581sentence\uff5c>", "")
 
-    # Remove all grounding refs (including image refs — they are not useful text)
-    text = re.sub(r"<\|ref\|>.*?<\|/ref\|><\|det\|>.*?<\|/det\|>", "", text, flags=re.DOTALL)
+    if ref_is_content:
+        # "ocr" prompt: the recognized text itself is inside <|ref|>...<|/ref|>
+        # (in "document" mode that slot holds a layout label such as "title").
+        # Keep it, drop only the coordinates. Deleting the whole construct here
+        # returned empty text for every page in that mode.
+        text = re.sub(r"<\|ref\|>(.*?)<\|/ref\|><\|det\|>.*?<\|/det\|>", r"\1\n", text, flags=re.DOTALL)
+    else:
+        # Remove all grounding refs (including image refs — they are not useful text)
+        text = re.sub(r"<\|ref\|>.*?<\|/ref\|><\|det\|>.*?<\|/det\|>", "", text, flags=re.DOTALL)
 
     text = text.replace("\\coloneqq", ":=").replace("\\eqqcolon", "=:")
     text = _collapse_empty_table_cells(text)

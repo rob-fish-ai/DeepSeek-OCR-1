@@ -98,6 +98,16 @@ class OCRResult:
     # not work, because the usable budget is max_model_len minus the prompt
     # (~7,280 tokens for a 144-DPI A4 page, never the configured 8,192).
     hit_length_limit: bool = False
+    # True for the "ocr" prompt, where <|ref|>...<|/ref|> holds the recognized
+    # text rather than a layout label, so it is content, not markup.
+    ref_is_content: bool = False
+    # The page has little ink (a cover, divider or signature page). Short
+    # output is then correct, not a failure, and must not be capped or flagged.
+    sparse_page: bool = False
+    # How the text was produced: the prompt used, or e.g. "free_ocr_fallback".
+    source: str = "document"
+    # Degrees the page was turned (counter-clockwise) before reading; 0 = as received.
+    rotation: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -113,13 +123,26 @@ _GROUNDING_TAG_PATTERN = re.compile(
 )
 
 
-def _measure_grounding_tags(raw_text: str) -> int:
+# Markup only -- for the "ocr" prompt, whose <|ref|> contents are real text.
+_MARKUP_ONLY_PATTERN = re.compile(
+    r"<\|/?ref\|>"
+    r"|<\|det\|>.*?<\|/det\|>"
+    r"|<\uff5cend\u2581of\u2581sentence\uff5c>"
+)
+
+
+def _tag_pattern(ref_is_content: bool) -> re.Pattern:
+    return _MARKUP_ONLY_PATTERN if ref_is_content else _GROUNDING_TAG_PATTERN
+
+
+def _measure_grounding_tags(raw_text: str, ref_is_content: bool = False) -> int:
     """Count characters in the raw text that are grounding/coordinate tags.
 
     These tags are expected output format and their removal during
-    cleaning should not be counted as hallucination.
+    cleaning should not be counted as hallucination. In the "ocr" prompt mode
+    the <|ref|> contents are the recognized text, so only the markup counts.
     """
-    return sum(len(m.group()) for m in _GROUNDING_TAG_PATTERN.finditer(raw_text))
+    return sum(len(m.group()) for m in _tag_pattern(ref_is_content).finditer(raw_text))
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +164,7 @@ def _score_hallucination_ratio(result: OCRResult) -> float:
         return 0.0
 
     # Subtract characters that are expected format, not hallucination
-    tag_chars = _measure_grounding_tags(result.raw_text)
+    tag_chars = _measure_grounding_tags(result.raw_text, result.ref_is_content)
     dedup_removed = 0
     if result.clean_stats is not None:
         dedup_removed = result.clean_stats.dedup_chars_removed
@@ -180,7 +203,7 @@ def _score_token_efficiency(result: OCRResult) -> float:
     # large fraction of the raw text. Excluding them here matches what
     # _score_hallucination_ratio does; leaving them in depressed survival for
     # every grounded page and pushed truncated-but-good pages into red.
-    effective_raw = max(1, raw_len - _measure_grounding_tags(result.raw_text))
+    effective_raw = max(1, raw_len - _measure_grounding_tags(result.raw_text, result.ref_is_content))
 
     # Of everything the model emitted before running out of room, how much
     # was real content? A truncated dense page keeps nearly all of it; a
@@ -260,7 +283,7 @@ def _score_repetition_density(result: OCRResult) -> float:
     generation loop both scored 0.000 -- making it a flat penalty on exactly
     the forms and invoices this service handles rather than a signal.
     """
-    return 1.0 - _measure_degeneration(result.raw_text)
+    return 1.0 - _measure_degeneration(result.raw_text, result.ref_is_content)
 
 
 def _score_content_density(result: OCRResult) -> float:
@@ -291,7 +314,7 @@ def _score_content_density(result: OCRResult) -> float:
 _DEGENERATION_MIN_CHARS = 2000
 
 
-def _measure_degeneration(text: str) -> float:
+def _measure_degeneration(text: str, ref_is_content: bool = False) -> float:
     """How much more compressible the tail of the output is than its head.
 
     A generation loop decays over time, so its last quarter collapses to
@@ -308,7 +331,7 @@ def _measure_degeneration(text: str) -> float:
     with markup included was rejected: a legitimate dense table compresses
     just as hard and would be capped as a loop.
     """
-    stripped = _GROUNDING_TAG_PATTERN.sub(" ", text)
+    stripped = _tag_pattern(ref_is_content).sub(" ", text)
     stripped = re.sub(r"<[^>]+>", " ", stripped)
     stripped = re.sub(r"\s+", " ", stripped).strip().encode("utf-8", "ignore")
     if len(stripped) < _DEGENERATION_MIN_CHARS:
@@ -378,7 +401,7 @@ def _score_self_consistency(
 # Composite scoring
 # ---------------------------------------------------------------------------
 
-def _compression_ratio(text: str) -> float:
+def _compression_ratio(text: str, ref_is_content: bool = False) -> float:
     """Compressed size over raw size for the whole output. Lower = more
     repetitive. Normal prose sits around 0.25-0.40; a generation loop
     collapses below 0.05.
@@ -387,7 +410,7 @@ def _compression_ratio(text: str) -> float:
     with forty repeated label rows also compresses to ~0.03, and must not be
     treated as a loop.
     """
-    stripped = _GROUNDING_TAG_PATTERN.sub(" ", text)
+    stripped = _tag_pattern(ref_is_content).sub(" ", text)
     stripped = re.sub(r"<[^>]+>", " ", stripped)
     stripped = re.sub(r"\s+", " ", stripped).strip().encode("utf-8", "ignore")
     if len(stripped) < _DEGENERATION_MIN_CHARS:
@@ -431,7 +454,9 @@ def _apply_composite(
     # Blank / near-blank pages: several metrics return perfect scores on empty
     # output, so cap rather than let the composite float up.
     clean_len = len(result.clean_text.strip())
-    if clean_len <= 10:
+    if result.sparse_page and clean_len > 0:
+        pass    # little ink on the page: little text is the right answer
+    elif clean_len <= 10:
         composite = min(composite, 0.10)
     elif clean_len <= 30:
         composite = min(composite, 0.30)
@@ -443,8 +468,8 @@ def _apply_composite(
     # relative to head), and one that starts early enough that head and tail
     # look alike and only absolute compressibility gives it away.
     if result.hit_length_limit and (
-        _measure_degeneration(result.raw_text) > _LOOP_DEGENERATION_THRESHOLD
-        or _compression_ratio(result.raw_text) < _LOOP_COMPRESSION_THRESHOLD
+        _measure_degeneration(result.raw_text, result.ref_is_content) > _LOOP_DEGENERATION_THRESHOLD
+        or _compression_ratio(result.raw_text, result.ref_is_content) < _LOOP_COMPRESSION_THRESHOLD
     ):
         composite = min(composite, _LOOP_COMPOSITE_CAP)
 
@@ -575,8 +600,8 @@ def compute_flags(
     clean_len = len(result.clean_text.strip())
     score = result.score
 
-    # --- No content → always red ---
-    if clean_len <= 10:
+    # --- No content → always red (a sparse page's few words do count) ---
+    if clean_len == 0 or (clean_len <= 10 and not result.sparse_page):
         return {
             "flag": "red",
             "message": "No meaningful text extracted. Manual review required.",
