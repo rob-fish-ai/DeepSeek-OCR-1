@@ -332,3 +332,13 @@ def test_degenerate_sideways_page_gets_rotated(service):
     r = asyncio.run(go()).json()
     assert engine.calls == ["document", "document"]
     assert r["rotation"] == 270 and "8/8/8" not in r["text"]
+
+
+def test_table_markup_is_not_mistaken_for_a_loop():
+    """A correct 26-row ledger read as 896 'td' of 1,104 words and was declared
+    degenerate: seven real pages were retried and replaced by worse reads."""
+    from process.score import is_degenerate_output
+    ledger = "<table>" + "".join(
+        f"<tr><td>02/{d:02d}/2026</td><td>{d * 3.17:.2f}</td>" + "<td></td>" * 14 + "</tr>" for d in range(1, 27)
+    ) + "</table>"
+    assert not is_degenerate_output(ledger)

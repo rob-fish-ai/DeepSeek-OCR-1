@@ -358,8 +358,15 @@ _DEGENERATE_DISTINCT_RATIO = 0.05
 
 
 def is_degenerate_output(text: str) -> bool:
-    """Long output made of almost no distinct words: a generation loop."""
-    words = _WORD.findall(text.lower())
+    """Long output made of almost no distinct words: a generation loop.
+
+    Markup is stripped before counting. Without that, every <td> in a table
+    counts as the word "td": a correct 26-row ledger read as 896 "td" out of
+    1,104 words and was declared a loop -- seven real pages, retried and
+    replaced by worse reads. The thresholds were calibrated on markup-free
+    text, so this must match.
+    """
+    words = _WORD.findall(re.sub(r"<[^>]+>", " ", text).lower())
     return len(words) >= _DEGENERATE_MIN_WORDS and len(set(words)) / len(words) < _DEGENERATE_DISTINCT_RATIO
 
 
