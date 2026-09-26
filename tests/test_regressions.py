@@ -530,3 +530,19 @@ def test_read_that_ran_out_of_room_does_not_beat_a_clean_one(service):
     r = asyncio.run(go()).json()
     assert engine.calls == ["document"] * 3 + ["free_ocr"] * 3
     assert r["rotation"] == 0 and r["source"] == "free_ocr" and not r["hit_length_limit"]
+
+
+def test_read_that_ran_out_of_room_is_retried(service):
+    """A signature page read as "2545/2546/2547/..." to the length limit has no
+    repeated words, so the loop checks missed it: it scored 0.90 and was
+    accepted after one read, with the end of the page missing."""
+    counting = (PLAIN_TEXT + "\n" + "/".join(str(n) for n in range(1000, 4000)), 7280, "length")
+    client, install = service
+    engine = install({"document": counting, "free_ocr": (PLAIN_TEXT, 240, "stop")})
+
+    async def go():
+        async with client() as c:
+            return await post(c, page_png(), retry=True)
+    r = asyncio.run(go()).json()
+    assert len(engine.calls) > 1 and "free_ocr" in engine.calls
+    assert r["source"] == "free_ocr" and not r["hit_length_limit"]

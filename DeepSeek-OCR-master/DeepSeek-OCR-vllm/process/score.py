@@ -454,6 +454,10 @@ _LOOP_DEGENERATION_THRESHOLD = 0.45
 # examples, not labelled production data -- see the note in compute_flags.
 _LOOP_COMPRESSION_THRESHOLD = 0.025
 _LOOP_COMPOSITE_CAP = 0.35
+# Any read that ran out of room: below the retry threshold (0.6), at the yellow
+# floor's side of it (0.50), so it is retried and, if nothing better turns up,
+# flagged yellow as before.
+_TRUNCATED_COMPOSITE_CAP = 0.55
 
 
 def _apply_composite(
@@ -498,6 +502,15 @@ def _apply_composite(
         composite = min(composite, _LOOP_COMPOSITE_CAP)
     elif is_degenerate_output(result.clean_text):
         composite = min(composite, _LOOP_COMPOSITE_CAP)
+
+    # Ran out of room without visibly repeating. The end of the page is missing
+    # either way, and some loops get past the checks above: a signature page
+    # read as "2545/2546/2547/..." to the limit has no repeated words, scored
+    # 0.90 and was accepted without a retry. Keeping it below the retry
+    # threshold sends it to the loop rescue; it is still the answer when every
+    # read runs out of room.
+    if result.hit_length_limit:
+        composite = min(composite, _TRUNCATED_COMPOSITE_CAP)
 
     return composite
 

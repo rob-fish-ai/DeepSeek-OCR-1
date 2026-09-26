@@ -327,13 +327,14 @@ text is correct.** Every metric is computed from the output string; none
 compares against the image, so fluent-but-wrong OCR is invisible by
 construction. Treat a green flag as "the model did not visibly malfunction".
 
-Two hard caps override the weighted sum:
+Hard caps override the weighted sum:
 
 | Condition | Cap |
 |-----------|-----|
 | Clean text ≤ 10 chars | 0.10 |
 | Clean text ≤ 30 chars | 0.30 |
 | Ran out of room **and** output collapsed (see repetition_density) | 0.35 |
+| Ran out of room at all | 0.55 |
 
 The caps do most of the work at the failure end: in a sample of 1,499 stored
 results, 40.8% were exactly 0.100 and 4.7% exactly 0.300.
@@ -451,6 +452,7 @@ finish_reason == "length" AND (           → composite capped at 0.35
     tail-vs-head degeneration > 0.45
     OR whole-output compression < 0.025
 )
+finish_reason == "length"                 → composite capped at 0.55
 ```
 
 The loop cap is gated on `finish_reason` because a legitimate form with forty
@@ -458,6 +460,14 @@ repeated label rows compresses to ~0.028 — close to a true loop's 0.006-0.016 
 and must not be capped. Pages that stop on their own are never affected,
 however repetitive they are. These thresholds are calibrated on constructed
 examples, not labelled production data; see *Calibration debt* below.
+
+Any read that ran out of room is capped at 0.55: below the 0.6 retry
+threshold, so the page gets the loop rescue, and above the 0.50 yellow floor,
+so a page where every read runs out of room is flagged yellow, as before. The
+end of such a page is missing whatever its text looks like, and some loops pass
+both loop tests. A signature page read as `2545/2546/2547/…` to the limit has no
+repeated words; it scored 0.90 and was accepted after a single read. With
+`SCORE_THRESHOLD` set below 0.55, these reads would pass again.
 
 ### Flag Assignment
 
