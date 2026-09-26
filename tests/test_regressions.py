@@ -490,3 +490,19 @@ def test_clean_first_angle_skips_the_second(service):
     r = asyncio.run(go()).json()
     assert engine.calls == ["document", "document"]
     assert r["rotation"] == 270
+
+
+def test_confidence_rescue_does_not_rescue_a_looping_angle(service):
+    """The original read was accepted, so a looping angle is not the page's only
+    chance: rescuing it cost ~80 s per page and never changed the angle."""
+    client, install = service
+    # calls: 1 upright (invented, accepted), 2 at 270 (confident), 3 at 90 (loops)
+    engine = install({"document": lambda n: {1: INVENTED, 2: CONFIDENT}.get(n, LOOP),
+                      "free_ocr": (PLAIN_TEXT, 240, "stop")})
+
+    async def go():
+        async with client() as c:
+            return await post(c, sideways_png(), retry=True)
+    r = asyncio.run(go()).json()
+    assert engine.calls == ["document", "document", "document"]
+    assert r["rotation"] == 270

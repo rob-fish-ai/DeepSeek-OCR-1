@@ -897,11 +897,13 @@ async def _read_rotations(
     prompt_key: str,
     results: list[OCRResult],
     sparse_page: bool,
-    settle_early: bool = True,
+    trust_score: bool = True,
 ) -> list[OCRResult]:
     """Read the page turned 270 and 90 degrees, stopping at the first clean,
-    clearly good read unless `settle_early` is off (the confidence rescue, where
-    a green score is exactly what cannot be trusted).
+    clearly good read. The confidence rescue turns `trust_score` off (a green
+    score is exactly what it cannot trust) and with it the loop rescue: there
+    the original read was accepted, so a looping angle is not the page's only
+    chance, and rescuing it cost ~80 s per sideways page for no change in angle.
 
     An angle whose read loops first gets free_ocr, then a two-halves read, at
     that angle. The correct angle of a dense page often loops while the wrong
@@ -923,8 +925,10 @@ async def _read_rotations(
         # on sideways pages (the wrong angle loops too, and its rescue loops
         # again) for at most one more page in 45; with this bar the angle was
         # right on 44 of 45, 9 needed a rescue and 33 needed only one read.
-        if settle_early and not _looped(r) and r.score and r.score.composite >= _ANGLE_CLEARLY_READ:
+        if trust_score and not _looped(r) and r.score and r.score.composite >= _ANGLE_CLEARLY_READ:
             return reads
+    if not trust_score:
+        return reads
     for deg, r in ((270, reads[0]), (90, reads[1])):
         if not _looped(r):
             continue
@@ -989,7 +993,7 @@ async def _confidence_rescue(
             and _looks_sideways(image)):
         return best
     logger.info("Weakest stretch %.2f on a page that looks sideways; trying rotations", conf["worst_window"])
-    reads = await _read_rotations(image, prompt_key, results, sparse_page, settle_early=False)
+    reads = await _read_rotations(image, prompt_key, results, sparse_page, trust_score=False)
     candidates = [r for r in reads if not _looped(r) and r.confidence]
     if candidates:
         # The angle by score (better at choosing the angle than confidence);
