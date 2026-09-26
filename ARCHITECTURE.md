@@ -569,7 +569,7 @@ the best score picked the most accurate read in all five cases examined.
 | Attempt 1 failed because… | Then tries, in order |
 |---|---|
 | It looped on an upright page — ran out of room (`finish_reason == "length"`), or produced degenerate output (below) | no enhancement (`"none"` preset) → `free_ocr` prompt → the page read as two halves |
-| The page looks sideways (it ran out of room or not) | rotated 270° → rotated 90° → `free_ocr` |
+| The page looks sideways (it ran out of room or not) | read at **both** 270° and 90°; an angle that loops gets `free_ocr`, then two halves, at that angle; best score wins. If nothing reads well and the page looped upright, the upright loop rescue runs too |
 | Anything else | `"none"` preset → `"strong"` preset (contrast 1.5×, sharpness 2×) |
 
 Why: on pages that looped under every contrast preset, `free_ocr` rescued 3 of 4
@@ -587,6 +587,13 @@ distinct-word ratio below 0.05 is treated as a loop: it gets the 0.35 loop cap,
 a `degenerate_output` warning, and the rescue ladder. Measured ratios: degenerate
 outputs 0.004–0.072, lowest correct output (F1 ≥ 0.8) 0.115, lowest of 220 real
 scanned-page outputs 0.254.
+
+Why both angles, and why rescue first: the correct angle of a dense page often
+loops while the wrong angle yields garbage that does not. A bank statement's
+correct 270° read looped (capped at 0.35) and its upside-down 90° read scored
+0.59, so the wrong angle won; rescued, the 270° read scored 0.85. Across 45
+sideways pages, the best score over both angles chose the right angle 42 times,
+against 41 for stopping at the first acceptable read and 39–40 for confidence.
 
 "Looks sideways" is a cheap ink-profile test, consulted only for pages that
 already failed, and only to order the attempts: on labelled pages it was right
@@ -667,7 +674,13 @@ def is_low_quality_scan(image):
 12% content-area test was meant for shrunken or thumbnail scans, but it also
 matched every cover page, chapter divider and short closing page, and small ID
 cards photographed on a full page — all returned as empty text. Such pages are
-now read normally. The same test now marks them `sparse_page` for scoring, so a
+now read normally. A page is marked `sparse_page` for scoring if this test
+matches **or** fewer than 8% of its rows hold any ink. The row test catches pages
+with a header at the top and a stamp or footer at the bottom and nothing between
+(a fax cover, web printouts), whose content box spans the page; measured, such
+pages had 2.2–5.2% of rows inked, every other page at least 11.6% — including a
+faint scan full of handwriting (61.7%). The sideways check abstains on sparse
+pages: too little text to judge. For a sparse page, a
 short correct answer ("Annual Report 2025") is neither capped at 0.30 nor
 flagged red. Empty output from a sparse page is still red.
 

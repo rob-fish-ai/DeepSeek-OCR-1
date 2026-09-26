@@ -885,6 +885,44 @@ async def _attempt(
     return result
 
 
+def _looped(r: OCRResult) -> bool:
+    return r.hit_length_limit or is_degenerate_output(r.clean_text)
+
+
+async def _read_rotations(
+    image: Image.Image,
+    prompt_key: str,
+    results: list[OCRResult],
+    sparse_page: bool,
+) -> list[OCRResult]:
+    """Read the page turned 270 and 90 degrees; both, not the first acceptable.
+
+    An angle whose read loops first gets free_ocr, then a two-halves read, at
+    that angle. The correct angle of a dense page often loops while the wrong
+    angle yields garbage that does not: a bank statement's correct 270-degree
+    read looped (capped at 0.35) and the upside-down 90-degree read scored 0.59,
+    so the wrong angle won. Rescued, the 270-degree read scored 0.85. On 45
+    sideways pages, choosing the angle by best score across both reads was
+    right 42 times; stopping at the first acceptable read, 41; by confidence,
+    39-40.
+    """
+    reads = []
+    for deg in (270, 90):
+        r = await _attempt(image, prompt_key, f"rotate_{deg}", results, sparse_page, rotate=deg)
+        results.append(r)
+        reads.append(r)
+        if not _looped(r):
+            continue
+        for label, prompt, split in ((f"rotate_{deg}+free_ocr", "free_ocr", False),
+                                     (f"rotate_{deg}+split", prompt_key, True)):
+            a = await _attempt(image, prompt, label, results, sparse_page, rotate=deg, split=split)
+            results.append(a)
+            reads.append(a)
+            if not _looped(a) and not needs_retry(a, SCORE_THRESHOLD):
+                break
+    return reads
+
+
 def _rescue_ladder(image: Image.Image, first: OCRResult, prompt_key: str) -> tuple[str, list[dict]]:
     """Returns (kind, strategies) for a failed first attempt.
 
@@ -895,22 +933,25 @@ def _rescue_ladder(image: Image.Image, first: OCRResult, prompt_key: str) -> tup
     pages the right rotation fixed 4 of 4. The contrast presets rescued none,
     so they remain only for pages that failed some other way.
 
-    kind is "loop" (try every strategy, keep the best), "sideways" (stop at the
-    first that reads well: only one orientation is right) or "presets".
+    kind is "loop" (try every strategy, keep the best), "sideways" (handled by
+    _read_rotations; no steps) or "presets".
     """
     sideways = _looks_sideways(image)
     looped = first.hit_length_limit or is_degenerate_output(first.clean_text)
     if LOOP_RESCUE and prompt_key == "document" and (looped or sideways):
         if sideways:
-            return "sideways", [dict(label="rotate_270", rotate=270), dict(label="rotate_90", rotate=90),
-                                dict(label="free_ocr", prompt="free_ocr")]
+            return "sideways", []
         # The default "adaptive" enhancement itself sends some pages into a
         # loop that the same page without enhancement reads cleanly, so that is
         # tried first. Eval: dropping it regressed two pages it had rescued.
-        none_preset = next(p for p in ENHANCEMENT_PRESETS if p["name"] == "none")
-        return "loop", [dict(label="none", preset=none_preset), dict(label="free_ocr", prompt="free_ocr"),
-                        dict(label="split_halves", split=True)]
+        return _rescue_ladder_upright(prompt_key)
     return "presets", [dict(label=p["name"], preset=p) for p in ENHANCEMENT_PRESETS[1:MAX_RETRIES]]
+
+
+def _rescue_ladder_upright(prompt_key: str) -> tuple[str, list[dict]]:
+    none_preset = next(p for p in ENHANCEMENT_PRESETS if p["name"] == "none")
+    return "loop", [dict(label="none", preset=none_preset), dict(label="free_ocr", prompt="free_ocr"),
+                    dict(label="split_halves", split=True)]
 
 
 async def _confidence_rescue(
@@ -933,15 +974,12 @@ async def _confidence_rescue(
             and _looks_sideways(image)):
         return best
     logger.info("Weakest stretch %.2f on a page that looks sideways; trying rotations", conf["worst_window"])
-    candidates = []
-    for deg in (270, 90):
-        attempt = await _attempt(image, prompt_key, f"rotate_{deg}", results, sparse_page, rotate=deg)
-        results.append(attempt)
-        if (not attempt.hit_length_limit and attempt.confidence
-                and not is_degenerate_output(attempt.clean_text)):
-            candidates.append(attempt)
+    reads = await _read_rotations(image, prompt_key, results, sparse_page)
+    candidates = [r for r in reads if not _looped(r) and r.confidence]
     if candidates:
-        top = max(candidates, key=lambda r: r.confidence["worst_window"])
+        # The angle by score (better at choosing the angle than confidence);
+        # adoption by the confidence margin the rule was validated with.
+        top = max(candidates, key=lambda r: r.score.composite if r.score else 0.0)
         if top.confidence["worst_window"] >= conf["worst_window"] + CONFIDENCE_RESCUE_MARGIN:
             logger.info("Adopted %s: weakest stretch %.2f -> %.2f", top.preset_name,
                         conf["worst_window"], top.confidence["worst_window"])
@@ -969,6 +1007,12 @@ async def _run_inference_with_retry(
 
     if MAX_RETRIES > 1 and needs_retry(first, SCORE_THRESHOLD):
         kind, ladder = _rescue_ladder(image, first, prompt_key)
+        if kind == "sideways":
+            await _read_rotations(image, prompt_key, results, sparse_page)
+            if _looped(first) and all(needs_retry(r, SCORE_THRESHOLD) for r in results):
+                # No angle read well: the sideways call may be wrong, so give the
+                # upright page the ordinary loop rescue too.
+                kind, ladder = _rescue_ladder_upright(prompt_key)
         for step in ladder:
             last = results[-1]
             # Only the plain preset retries give up on "hopeless" pages: a

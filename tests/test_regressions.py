@@ -273,7 +273,7 @@ def test_sideways_page_tries_rotation_first(service):
         async with client() as c:
             return await post(c, sideways_png(), retry=True)
     r = asyncio.run(go()).json()
-    assert engine.calls == ["document", "document"]
+    assert engine.calls == ["document", "document", "document"]    # upright, then BOTH angles
     assert r["rotation"] == 270 and r["flag"] != "red"
 
 
@@ -330,7 +330,7 @@ def test_degenerate_sideways_page_gets_rotated(service):
         async with client() as c:
             return await post(c, sideways_png(), retry=True)
     r = asyncio.run(go()).json()
-    assert engine.calls == ["document", "document"]
+    assert engine.calls == ["document", "document", "document"]
     assert r["rotation"] == 270 and "8/8/8" not in r["text"]
 
 
@@ -438,3 +438,22 @@ def test_sparse_fax_cover_short_read_is_kept_and_not_rotated(service):
     r = asyncio.run(go()).json()
     assert engine.calls == ["document"]
     assert r["rotation"] == 0 and "Internal Use" in r["text"] and r["flag"] != "red"
+
+
+
+def test_correct_angle_that_loops_is_rescued_before_comparing(service):
+    """A statement's correct 270-degree read looped (capped 0.35) and the
+    upside-down 90-degree read did not (0.59), so the wrong angle won. The
+    looping angle is now rescued first; rescued, it read correctly (0.85)."""
+    client, install = service
+    upside_down = ("<table><tr><td>1.266.47</td><td></td><td></td></tr><tr><td></td><td>1.266.47</td></tr></table>",
+                   60, "stop")
+    # calls: 1 upright (loops), 2 at 270 (loops), 3 free_ocr at 270 (good), 4 at 90 (garbage)
+    engine = install({"document": lambda n: LOOP if n <= 2 else upside_down, "free_ocr": (PLAIN_TEXT, 240, "stop")})
+
+    async def go():
+        async with client() as c:
+            return await post(c, sideways_png(), retry=True)
+    r = asyncio.run(go()).json()
+    assert engine.calls == ["document", "document", "free_ocr", "document"]
+    assert r["rotation"] == 270 and r["source"] == "free_ocr"
