@@ -137,6 +137,7 @@ LOOP_RESCUE = os.environ.get("LOOP_RESCUE", "true").lower() == "true"
 CONFIDENCE_LOGPROBS = os.environ.get("CONFIDENCE_LOGPROBS", "true").lower() == "true"
 _LOG_HALF = math.log(0.5)
 _CONFIDENCE_WINDOW = 64
+_CONFIDENCE_HEAD = 256
 
 # Acting on it. On the simulated set the weakest 64-token stretch separated bad
 # reads from good ones (AUC 0.97; 0.96 on reads that scored green), while the
@@ -635,7 +636,7 @@ async def _format_result(inference_output: dict, raw: bool, image: Image.Image =
         clean_stats=stats,
         hit_length_limit=inference_output.get("hit_length_limit", False),
         ref_is_content=ref_is_content,
-        sparse_page=image is not None and is_low_quality_scan(image),
+        sparse_page=image is not None and _is_sparse_page(image),
         source=inference_output.get("source", "document"),
     )
     score = await asyncio.to_thread(score_result, ocr_result)
@@ -734,10 +735,23 @@ def _confidence(token_ids, logprobs) -> Optional[dict]:
             run += vals[i] - vals[i - _CONFIDENCE_WINDOW]
             worst = min(worst, run)
         worst /= _CONFIDENCE_WINDOW
+    head = vals[:_CONFIDENCE_HEAD]
+    head_worst = sum(head) / len(head)
+    if len(head) > _CONFIDENCE_WINDOW:
+        run = sum(head[:_CONFIDENCE_WINDOW])
+        head_worst = run
+        for i in range(_CONFIDENCE_WINDOW, len(head)):
+            run += head[i] - head[i - _CONFIDENCE_WINDOW]
+            head_worst = min(head_worst, run)
+        head_worst /= _CONFIDENCE_WINDOW
     return {
         "mean_logprob": round(sum(vals) / n, 4),
         "low_conf_frac": round(sum(1 for v in vals if v < _LOG_HALF) / n, 4),
         "worst_window": round(worst, 4),
+        # The opening of the read, before any loop sets in -- a correctly
+        # oriented page that later loops may still start confidently.
+        "head_mean": round(sum(head) / len(head), 4),
+        "head_worst": round(head_worst, 4),
         "tokens": n,
     }
 
@@ -751,8 +765,28 @@ def _merge_confidence(a: Optional[dict], b: Optional[dict]) -> Optional[dict]:
         "mean_logprob": round((a["mean_logprob"] * a["tokens"] + b["mean_logprob"] * b["tokens"]) / n, 4),
         "low_conf_frac": round((a["low_conf_frac"] * a["tokens"] + b["low_conf_frac"] * b["tokens"]) / n, 4),
         "worst_window": min(a["worst_window"], b["worst_window"]),
+        "head_mean": a.get("head_mean"),
+        "head_worst": a.get("head_worst"),
         "tokens": n,
     }
+
+
+# A page is sparse if its content box is small (is_low_quality_scan) OR few of
+# its rows hold any ink. The box test alone misses pages with a header line at
+# the top and a stamp or footer at the bottom and nothing between -- a fax
+# cover, web printouts -- whose box spans the whole page. Measured share of
+# rows holding ink: pages judged sparse by eye 2.2-5.2%; every other page,
+# including a faint scan full of handwriting (61.7%), at least 11.6%.
+_SPARSE_ROW_COVERAGE = 0.08
+
+
+def _row_coverage(image: Image.Image) -> float:
+    g = np.asarray(image.convert("L"))
+    return float(((g < 200).sum(axis=1) > g.shape[1] * 0.005).mean())
+
+
+def _is_sparse_page(image: Image.Image) -> bool:
+    return is_low_quality_scan(image) or _row_coverage(image) < _SPARSE_ROW_COVERAGE
 
 
 def _looks_sideways(image: Image.Image) -> bool:
@@ -766,6 +800,8 @@ def _looks_sideways(image: Image.Image) -> bool:
     were really sparse pages or ID cards, which costs extra attempts, not
     correctness.
     """
+    if _row_coverage(image) < _SPARSE_ROW_COVERAGE:
+        return False    # too little text to judge: a sparse fax cover was read as sideways
     im = image.convert("L")
     im.thumbnail((1200, 1200))
     ink = (np.asarray(im) < 160).astype(np.float32)
@@ -922,7 +958,7 @@ async def _run_inference_with_retry(
     Returns the best-scoring attempt.
     """
     results: list[OCRResult] = []
-    sparse_page = is_low_quality_scan(image)
+    sparse_page = _is_sparse_page(image)
 
     # Below this, contrast presets are pointless — the page needs external OCR
     HOPELESS_THRESHOLD = 0.20

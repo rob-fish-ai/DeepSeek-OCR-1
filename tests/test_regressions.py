@@ -410,3 +410,31 @@ def test_rotation_kept_out_unless_clearly_more_confident(service):
             return await post(c, sideways_png(), retry=True)
     r = asyncio.run(go()).json()
     assert len(engine.calls) == 3 and r["rotation"] == 0
+
+
+def fax_cover_png():
+    """Header line at the top, stamp at the bottom, nothing between: the content
+    box spans the page, so only row coverage reveals it is sparse."""
+    im = Image.new("RGB", (1280, 1920), "white")
+    d = ImageDraw.Draw(im)
+    f = ImageFont.load_default(size=26)
+    d.text((60, 60), "HRB Fax Server  2/10/2026 6:44:49 AM  PAGE 2/005  Fax Server", fill="black", font=f)
+    d.text((80, 140), "Internal Use", fill="black", font=f)
+    d.text((820, 1800), "RECEIVED FEB 10 2026", fill="black", font=f)
+    b = io.BytesIO(); im.save(b, "PNG")
+    return b.getvalue()
+
+
+def test_sparse_fax_cover_short_read_is_kept_and_not_rotated(service):
+    """A fax cover's correct short read was capped at 0.30 as a failure, which
+    started the rescue ladder, where the sparse page passed for sideways."""
+    client, install = service
+    short = ("<|ref|>text<|/ref|><|det|>[[1, 1, 2, 2]]<|/det|>\nInternal Use\nRECEIVED FEB 10 2026", 21, "stop")
+    engine = install({"document": short, "free_ocr": (PLAIN_TEXT, 240, "stop")})
+
+    async def go():
+        async with client() as c:
+            return await post(c, fax_cover_png(), retry=True)
+    r = asyncio.run(go()).json()
+    assert engine.calls == ["document"]
+    assert r["rotation"] == 0 and "Internal Use" in r["text"] and r["flag"] != "red"
