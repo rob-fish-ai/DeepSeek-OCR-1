@@ -888,6 +888,11 @@ async def _attempt(
 _ANGLE_CLEARLY_READ = 0.90
 
 
+def _read_well(r: OCRResult) -> bool:
+    """Passed the threshold without running out of room or repeating."""
+    return not _looped(r) and not needs_retry(r, SCORE_THRESHOLD)
+
+
 def _looped(r: OCRResult) -> bool:
     return r.hit_length_limit or is_degenerate_output(r.clean_text)
 
@@ -898,6 +903,7 @@ async def _read_rotations(
     results: list[OCRResult],
     sparse_page: bool,
     trust_score: bool = True,
+    upright_looped: bool = False,
 ) -> list[OCRResult]:
     """Read the page turned 270 and 90 degrees, stopping at the first clean,
     clearly good read. The confidence rescue turns `trust_score` off (a green
@@ -905,8 +911,14 @@ async def _read_rotations(
     the original read was accepted, so a looping angle is not the page's only
     chance, and rescuing it cost ~80 s per sideways page for no change in angle.
 
-    An angle whose read loops first gets free_ocr, then a two-halves read, at
-    that angle. The correct angle of a dense page often loops while the wrong
+    When neither angle reads well, free_ocr is tried at each looping angle,
+    then upright (if the upright read looped too), then a two-halves read at
+    each looping angle, stopping at the first clean read. free_ocr goes first
+    everywhere because it is cheap and most often the rescue; upright comes
+    after the rotations because the page looked sideways. A real scanned page
+    the sideways test got wrong looped at both angles; rescuing the angles
+    first, then upright, took 7 calls and adopted a 90-degree read that ran out
+    of room, where upright free_ocr read it cleanly. The correct angle of a dense page often loops while the wrong
     angle yields garbage that does not: a bank statement's correct 270-degree
     read looped (capped at 0.35) and the upside-down 90-degree read scored 0.59,
     so the wrong angle won. Rescued, the 270-degree read scored 0.85. On 45
@@ -929,16 +941,18 @@ async def _read_rotations(
             return reads
     if not trust_score:
         return reads
-    for deg, r in ((270, reads[0]), (90, reads[1])):
-        if not _looped(r):
-            continue
-        for label, prompt, split in ((f"rotate_{deg}+free_ocr", "free_ocr", False),
-                                     (f"rotate_{deg}+split", prompt_key, True)):
-            a = await _attempt(image, prompt, label, results, sparse_page, rotate=deg, split=split)
-            results.append(a)
-            reads.append(a)
-            if not _looped(a) and not needs_retry(a, SCORE_THRESHOLD):
-                break
+    looping = [deg for deg, r in zip((270, 90), reads) if _looped(r)]
+    steps = [(deg, "free_ocr", False) for deg in looping]
+    if upright_looped:
+        steps.append((0, "free_ocr", False))
+    steps += [(deg, prompt_key, True) for deg in looping]
+    for deg, prompt, split in steps:
+        label = "free_ocr" if not deg else f"rotate_{deg}+{'split' if split else 'free_ocr'}"
+        a = await _attempt(image, prompt, label, results, sparse_page, rotate=deg, split=split)
+        results.append(a)
+        reads.append(a)
+        if _read_well(a):
+            break
     return reads
 
 
@@ -1027,11 +1041,14 @@ async def _run_inference_with_retry(
     if MAX_RETRIES > 1 and needs_retry(first, SCORE_THRESHOLD):
         kind, ladder = _rescue_ladder(image, first, prompt_key)
         if kind == "sideways":
-            await _read_rotations(image, prompt_key, results, sparse_page)
-            if _looped(first) and all(needs_retry(r, SCORE_THRESHOLD) for r in results):
-                # No angle read well: the sideways call may be wrong, so give the
-                # upright page the ordinary loop rescue too.
+            await _read_rotations(image, prompt_key, results, sparse_page, upright_looped=_looped(first))
+            if _looped(first) and not any(_read_well(r) for r in results):
+                # Nothing read well: the sideways call may be wrong, so give the
+                # upright page the rest of the ordinary loop rescue too. A read
+                # that ran out of room does not count as reading well, however it
+                # scores: the loop cap only catches loops that visibly repeat.
                 kind, ladder = _rescue_ladder_upright(prompt_key)
+                ladder = [step for step in ladder if step["label"] != "free_ocr"]   # already tried
         for step in ladder:
             last = results[-1]
             # Only the plain preset retries give up on "hopeless" pages: a
@@ -1056,6 +1073,14 @@ async def _run_inference_with_retry(
                 break
 
     best = await asyncio.to_thread(select_best_result, results)
+    if _looped(best):
+        # A read that ran out of room can still score well when its text does
+        # not visibly repeat (the model invents rather than loops). Prefer any
+        # read that passed without running out of room: a real page adopted a
+        # 12,751-character 90-degree read scoring 0.90 over a clean upright one.
+        well = [r for r in results if _read_well(r)]
+        if well:
+            best = max(well, key=lambda r: (r.score.composite, r.score.self_consistency))
     best = await _confidence_rescue(image, prompt_key, best, results, sparse_page)
 
     # select_best_result ranks candidates using cross-run self-consistency,

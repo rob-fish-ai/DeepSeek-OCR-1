@@ -603,6 +603,15 @@ as well, and its rescue loops again. Sideways pages went from 20–45 s to
 100–140 s (6–7 model calls). With the 0.90 bar, 44 of 45 pages still get the
 right angle, only 9 need a rescue, and 33 need a single rotated read.
 
+When neither angle reads well, the rescue tries free_ocr at each looping angle,
+then free_ocr upright (if the upright read looped too), then two-halves reads.
+It stops at the first clean read. A read that ran out of room never counts as
+clean, whatever it scores. The loop cap only catches loops that visibly repeat,
+and a model that invents varied text until the limit can score 0.90. For the
+same reason, the final pick prefers any read that passed without running out
+of room. A real scanned page the sideways test misjudged had adopted a
+12,751-character 90° read (192 s, 7 calls) over a clean upright one.
+
 "Looks sideways" is a cheap ink-profile test, consulted only for pages that
 already failed, and only to order the attempts: on labelled pages it was right
 8/8; across the failure corpus about half its calls were really sparse pages or

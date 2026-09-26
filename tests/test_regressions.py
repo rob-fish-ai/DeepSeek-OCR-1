@@ -506,3 +506,27 @@ def test_confidence_rescue_does_not_rescue_a_looping_angle(service):
     r = asyncio.run(go()).json()
     assert engine.calls == ["document", "document", "document"]
     assert r["rotation"] == 270
+
+
+def test_read_that_ran_out_of_room_does_not_beat_a_clean_one(service):
+    """A real scanned page looked sideways and looped at both angles. The
+    90-degree free_ocr read ran out of room with varied (invented) text, which
+    the loop cap does not catch, so it scored ~0.90 and was adopted over the
+    clean upright free_ocr read."""
+    import random
+    rng = random.Random(7)
+    vocab = ["account", "balance", "payment", "total", "date", "amount", "invoice", "tax",
+             "credit", "debit", "number", "statement", "period", "charge", "fee", "due"]
+    invented = " ".join(f"{rng.choice(vocab)} {rng.randint(100, 99999)}" for _ in range(2500))
+    client, install = service
+    # calls: 1 upright, 2 at 270, 3 at 90 (all loop); 4 free_ocr at 270 (loops),
+    # 5 free_ocr at 90 (ran out of room, varied), 6 free_ocr upright (clean)
+    engine = install({"document": LOOP,
+                      "free_ocr": lambda n: {4: LOOP, 5: (invented, 7295, "length")}.get(n, (PLAIN_TEXT, 240, "stop"))})
+
+    async def go():
+        async with client() as c:
+            return await post(c, sideways_png(), retry=True)
+    r = asyncio.run(go()).json()
+    assert engine.calls == ["document"] * 3 + ["free_ocr"] * 3
+    assert r["rotation"] == 0 and r["source"] == "free_ocr" and not r["hit_length_limit"]
