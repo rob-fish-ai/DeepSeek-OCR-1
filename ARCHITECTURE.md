@@ -595,6 +595,12 @@ correct 270° read looped (capped at 0.35) and its upside-down 90° read scored
 sideways pages, the best score over both angles chose the right angle 42 times,
 against 41 for stopping at the first acceptable read and 39–40 for confidence.
 
+Rescue is skipped when either angle already read cleanly with a score of 0.90
+or more. Rescuing every looping angle picked the right angle on all 45 pages,
+but the wrong angle usually loops as well, and its rescue loops again. Sideways
+pages went from 20–45 s to 100–140 s (6–7 model calls). With the 0.90 bar, 44
+of 45 pages still get the right angle, and only 9 need a rescue.
+
 "Looks sideways" is a cheap ink-profile test, consulted only for pages that
 already failed, and only to order the attempts: on labelled pages it was right
 8/8; across the failure corpus about half its calls were really sparse pages or

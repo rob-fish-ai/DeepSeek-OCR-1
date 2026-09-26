@@ -885,6 +885,9 @@ async def _attempt(
     return result
 
 
+_ANGLE_CLEARLY_READ = 0.90
+
+
 def _looped(r: OCRResult) -> bool:
     return r.hit_length_limit or is_degenerate_output(r.clean_text)
 
@@ -911,6 +914,13 @@ async def _read_rotations(
         r = await _attempt(image, prompt_key, f"rotate_{deg}", results, sparse_page, rotate=deg)
         results.append(r)
         reads.append(r)
+    # Rescue looping angles only when neither angle already read clearly well.
+    # Rescuing every looping angle tripled the time on sideways pages (the wrong
+    # angle loops too, and its rescue loops again) for at most one more page in
+    # 45; with this bar the angle was right on 44 of 45 and 9 needed a rescue.
+    if any(not _looped(r) and r.score and r.score.composite >= _ANGLE_CLEARLY_READ for r in reads):
+        return reads
+    for deg, r in ((270, reads[0]), (90, reads[1])):
         if not _looped(r):
             continue
         for label, prompt, split in ((f"rotate_{deg}+free_ocr", "free_ocr", False),
