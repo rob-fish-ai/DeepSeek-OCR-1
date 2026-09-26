@@ -603,6 +603,38 @@ set, 66 pages worse against 31 better).
 
 After all attempts, `select_best_result()` re-scores `self_consistency` using the full result set and picks the highest composite.
 
+### Confidence signal
+
+Every read records how probable the model found each token it generated
+(`logprobs=0`: the chosen token only), summarised as `confidence` in the
+response: `mean_logprob`, `low_conf_frac` (share of tokens under 50%),
+`worst_window` (lowest average over any 64-token stretch) and `tokens`.
+
+What it can and cannot tell, measured on the simulated set (162 pages):
+
+| Statistic | Separates bad reads (F1 < 0.5) from good (F1 ≥ 0.8) |
+|---|---|
+| `worst_window` | **AUC 0.97** — 0.96 on bad reads that scored green |
+| `mean_logprob` | AUC 0.35 — *backwards*: invented or looping text is fluent, so each next token is easy to predict |
+| `low_conf_frac` | AUC 0.30 — backwards, for the same reason |
+
+Use only `worst_window`. Somewhere in invented text the model is guessing.
+
+**Acting on it** (`CONFIDENCE_RESCUE`): after the retries, if the chosen read's
+`worst_window` is below −0.40 and the page looks sideways, the page is also read
+rotated 270° and 90°; the most confident of those (excluding reads that ran out
+of room or are degenerate) replaces the original only if its `worst_window` is at
+least 0.10 higher. Chosen by replaying real alternative reads of the 27 pages
+below −0.40: it changed 8 pages, all for the better (sideways pages from F1
+0.01–0.22 to 0.91–1.00), and none for the worse, across thresholds −0.35 to −0.45.
+Widening it to upright pages or to `free_ocr` introduced losses, so it is not.
+
+Limits: applies to `/ocr/image` and `/ocr/image/base64` with `retry=true`. PDF and
+batch pages only reach the retry path when their first read scores below 0.60,
+which a fluent invented read does not. Recording probabilities costs about 8.5%
+in total time and changes no output (byte-identical on all 162 pages).
+`CONFIDENCE_LOGPROBS=false` turns both off.
+
 ---
 
 ## Pre-flight Detection
@@ -846,6 +878,9 @@ returned text was cut off by the output budget, so the end of the page is missin
 | `FALLBACK_FREE_OCR` | `true` | Re-read a page labelled as one picture with `free_ocr` |
 | `LOOP_RESCUE` | `true` | Rescue ladder for runaway or sideways pages |
 | `SKIP_LOW_QUALITY_SCANS` | `false` | Restore the old skip of pages with little content |
+| `CONFIDENCE_LOGPROBS` | `true` | Record per-token confidence for every read |
+| `CONFIDENCE_RESCUE` | `true` | Rotate sideways pages whose read is unsure somewhere |
+| `CONFIDENCE_RESCUE_BELOW` / `_MARGIN` | `-0.40` / `0.10` | Trigger and adoption thresholds |
 | `FEEDBACK_DIR` | `./feedback` | Feedback storage path |
 | `FEEDBACK_ENABLED` | `true` | Enable feedback storage |
 | `FEEDBACK_SCORE_THRESHOLD` | `0.70` | Save results below this score |

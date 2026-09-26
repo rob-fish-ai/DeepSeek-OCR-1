@@ -369,3 +369,44 @@ def test_confidence_reported_per_request(service):
             return await post(c, page_png(), retry=False)
     r = asyncio.run(go()).json()
     assert "confidence" in r            # None with a stub engine that returns no logprobs
+
+
+INVENTED = (GROUNDED_TEXT, 300, "stop", 0.30)       # reads fine, one unsure stretch
+CONFIDENT = (GROUNDED_TEXT, 300, "stop")
+
+
+def test_sideways_invented_read_is_rotated_by_confidence(service):
+    """A sideways page read as fluent invented text scores green; only the
+    model's uncertainty gives it away."""
+    client, install = service
+    engine = install({"document": first_then(INVENTED, CONFIDENT)})
+
+    async def go():
+        async with client() as c:
+            return await post(c, sideways_png(), retry=True)
+    r = asyncio.run(go()).json()
+    assert engine.calls == ["document", "document", "document"]    # original + both rotations
+    assert r["rotation"] == 270
+
+
+def test_upright_unsure_read_is_left_alone(service):
+    """The rule is limited to pages that look sideways: widening it introduced losses."""
+    client, install = service
+    engine = install({"document": INVENTED})
+
+    async def go():
+        async with client() as c:
+            return await post(c, page_png(), retry=True)
+    r = asyncio.run(go()).json()
+    assert engine.calls == ["document"] and r["rotation"] == 0
+
+
+def test_rotation_kept_out_unless_clearly_more_confident(service):
+    client, install = service
+    engine = install({"document": INVENTED})                      # rotations no surer than the original
+
+    async def go():
+        async with client() as c:
+            return await post(c, sideways_png(), retry=True)
+    r = asyncio.run(go()).json()
+    assert len(engine.calls) == 3 and r["rotation"] == 0

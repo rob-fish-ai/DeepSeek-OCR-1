@@ -6,9 +6,11 @@ or model weights are needed, and the live service is never touched.
 """
 
 import asyncio
+import math
 import os
 import sys
 import tempfile
+from types import SimpleNamespace
 
 import pytest
 
@@ -29,22 +31,28 @@ PROMPT_BY_TEXT = {v: k for k, v in api_service.PROMPTS.items()}
 
 
 class Completion:
-    def __init__(self, text, tokens, finish_reason):
+    def __init__(self, text, tokens, finish_reason, weak=None):
         self.text = text
         self.token_ids = [0] * tokens
         self.finish_reason = finish_reason
+        # Per-token probabilities: confident throughout, or -- when `weak` is
+        # given -- a 64-token stretch at that probability, as invented text shows.
+        probs = [0.99] * tokens
+        if weak is not None:
+            probs[:64] = [weak] * min(64, tokens)
+        self.logprobs = [{0: SimpleNamespace(logprob=math.log(p))} for p in probs]
 
 
 class Output:
-    def __init__(self, text, tokens, finish_reason):
-        self.outputs = [Completion(text, tokens, finish_reason)]
+    def __init__(self, text, tokens, finish_reason, weak=None):
+        self.outputs = [Completion(text, tokens, finish_reason, weak)]
         self.prompt_token_ids = [0] * 913
 
 
 class ScriptedEngine:
     """Stands in for vLLM. `script` maps a prompt key ("document", "free_ocr",
-    ...) to (text, num_tokens, finish_reason), or to a callable returning that
-    for successive calls. Every call is recorded in `calls`."""
+    ...) to (text, num_tokens, finish_reason[, weak_probability]), or to a
+    callable returning that for successive calls. Every call is recorded."""
 
     def __init__(self, script):
         self.script = script
@@ -55,8 +63,8 @@ class ScriptedEngine:
         self.calls.append(key)
         await asyncio.sleep(0.01)
         spec = self.script[key]
-        text, tokens, finish = spec(len(self.calls)) if callable(spec) else spec
-        yield Output(text, tokens, finish)
+        text, tokens, finish, *weak = spec(len(self.calls)) if callable(spec) else spec
+        yield Output(text, tokens, finish, weak[0] if weak else None)
 
 
 @pytest.fixture

@@ -138,6 +138,19 @@ CONFIDENCE_LOGPROBS = os.environ.get("CONFIDENCE_LOGPROBS", "true").lower() == "
 _LOG_HALF = math.log(0.5)
 _CONFIDENCE_WINDOW = 64
 
+# Acting on it. On the simulated set the weakest 64-token stretch separated bad
+# reads from good ones (AUC 0.97; 0.96 on reads that scored green), while the
+# average confidence did not -- invented or looping text is fluent, so it runs
+# backwards (AUC 0.35). Rule, chosen by replaying real alternative reads: on a
+# page that looks sideways, a read whose weakest stretch is below -0.40 triggers
+# reads rotated both ways, and the most confident is adopted only if it beats
+# the original by 0.10. It changed 8 pages, all for the better (sideways pages
+# from F1 0.01-0.22 to 0.91-1.00), and none for the worse; widening it to every
+# page, or to free_ocr, introduced losses.
+CONFIDENCE_RESCUE = CONFIDENCE_LOGPROBS and os.environ.get("CONFIDENCE_RESCUE", "true").lower() == "true"
+CONFIDENCE_RESCUE_BELOW = float(os.environ.get("CONFIDENCE_RESCUE_BELOW", "-0.40"))
+CONFIDENCE_RESCUE_MARGIN = float(os.environ.get("CONFIDENCE_RESCUE_MARGIN", "0.10"))
+
 
 
 # Feedback storage
@@ -864,6 +877,42 @@ def _rescue_ladder(image: Image.Image, first: OCRResult, prompt_key: str) -> tup
     return "presets", [dict(label=p["name"], preset=p) for p in ENHANCEMENT_PRESETS[1:MAX_RETRIES]]
 
 
+async def _confidence_rescue(
+    image: Image.Image,
+    prompt_key: str,
+    best: OCRResult,
+    results: list[OCRResult],
+    sparse_page: bool,
+) -> OCRResult:
+    """Catch a sideways page read as fluent invented text.
+
+    Such a read scores green -- nothing in the text looks wrong -- but the
+    model is unsure somewhere in it. See CONFIDENCE_RESCUE for the rule and
+    how it was chosen.
+    """
+    conf = best.confidence
+    if not (CONFIDENCE_RESCUE and prompt_key == "document" and conf
+            and conf["worst_window"] < CONFIDENCE_RESCUE_BELOW
+            and not any(r.rotation for r in results)      # the rescue ladder already tried rotations
+            and _looks_sideways(image)):
+        return best
+    logger.info("Weakest stretch %.2f on a page that looks sideways; trying rotations", conf["worst_window"])
+    candidates = []
+    for deg in (270, 90):
+        attempt = await _attempt(image, prompt_key, f"rotate_{deg}", results, sparse_page, rotate=deg)
+        results.append(attempt)
+        if (not attempt.hit_length_limit and attempt.confidence
+                and not is_degenerate_output(attempt.clean_text)):
+            candidates.append(attempt)
+    if candidates:
+        top = max(candidates, key=lambda r: r.confidence["worst_window"])
+        if top.confidence["worst_window"] >= conf["worst_window"] + CONFIDENCE_RESCUE_MARGIN:
+            logger.info("Adopted %s: weakest stretch %.2f -> %.2f", top.preset_name,
+                        conf["worst_window"], top.confidence["worst_window"])
+            return top
+    return best
+
+
 async def _run_inference_with_retry(
     image: Image.Image,
     prompt_key: str,
@@ -908,6 +957,7 @@ async def _run_inference_with_retry(
                 break
 
     best = await asyncio.to_thread(select_best_result, results)
+    best = await _confidence_rescue(image, prompt_key, best, results, sparse_page)
 
     # select_best_result ranks candidates using cross-run self-consistency,
     # which a single first-pass result cannot have (it scores a flat 1.0).
