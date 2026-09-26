@@ -11,6 +11,7 @@ import base64
 import io
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -127,6 +128,15 @@ SKIP_LOW_QUALITY_SCANS = os.environ.get("SKIP_LOW_QUALITY_SCANS", "false").lower
 # Retry pages whose generation ran away, or that look sideways, with free_ocr,
 # a two-halves read, or rotation instead of contrast presets (see _rescue_ladder).
 LOOP_RESCUE = os.environ.get("LOOP_RESCUE", "true").lower() == "true"
+
+# Ask the engine for the probability of each generated token, and summarise it
+# per read as a confidence signal. Output-only checks cannot see a page the model
+# reads as fluent invented text (a sideways W-9 came back as a plausible W-9 at
+# F1 0.04, scoring green); the hypothesis is that the model is less sure of text
+# it invents. Currently only recorded, not acted on, until the eval shows it works.
+CONFIDENCE_LOGPROBS = os.environ.get("CONFIDENCE_LOGPROBS", "true").lower() == "true"
+_LOG_HALF = math.log(0.5)
+_CONFIDENCE_WINDOW = 64
 
 
 
@@ -313,6 +323,7 @@ def _skip_page_result(reason: str, flag_detail: str) -> dict:
         "source": "skipped",
         "rotation": 0,
         "hit_length_limit": False,
+        "confidence": None,
     }
 
 
@@ -553,6 +564,7 @@ async def _run_inference(image: Image.Image, prompt_key: str = DEFAULT_PROMPT) -
     completion = final_output.outputs[0]
     text = completion.text
     num_tokens = len(completion.token_ids)
+    confidence = _confidence(completion.token_ids, getattr(completion, "logprobs", None))
     prompt_tokens = len(final_output.prompt_token_ids or [])
     hit_length_limit = getattr(completion, "finish_reason", None) == "length"
 
@@ -565,6 +577,7 @@ async def _run_inference(image: Image.Image, prompt_key: str = DEFAULT_PROMPT) -
             "tokens": num_tokens,
             "hit_length_limit": hit_length_limit,
             "ms": round((time.monotonic() - started) * 1000),
+            "confidence": confidence,
         })
 
     # finish_reason == "length" means generation ran out of room rather than
@@ -584,6 +597,7 @@ async def _run_inference(image: Image.Image, prompt_key: str = DEFAULT_PROMPT) -
         "hit_length_limit": hit_length_limit,
         "prompt_used": prompt_key,
         "source": prompt_key,
+        "confidence": confidence,
     }
 
 
@@ -627,6 +641,7 @@ async def _format_result(inference_output: dict, raw: bool, image: Image.Image =
         "source": ocr_result.source,
         "rotation": 0,
         "hit_length_limit": ocr_result.hit_length_limit,
+        "confidence": inference_output.get("confidence"),
     }
 
     # Post-OCR blank page detection: only flag as blank if the image itself
@@ -678,6 +693,53 @@ async def _format_result(inference_output: dict, raw: bool, image: Image.Image =
         })
 
     return result
+
+
+def _confidence(token_ids, logprobs) -> Optional[dict]:
+    """Summarise the probability the model gave each token it generated.
+
+    mean_logprob   average log-probability per token (0 = certain)
+    low_conf_frac  share of tokens the model gave under 50%
+    worst_window   lowest average over any 64-token stretch -- invented text
+                   may be unsure locally rather than across the whole read
+    """
+    if not logprobs:
+        return None
+    vals = []
+    for tok, entry in zip(token_ids, logprobs):
+        lp = entry.get(tok) if entry else None
+        if lp is not None and math.isfinite(lp.logprob):
+            vals.append(lp.logprob)
+    if not vals:
+        return None
+    n = len(vals)
+    worst = sum(vals) / n
+    if n > _CONFIDENCE_WINDOW:
+        run = sum(vals[:_CONFIDENCE_WINDOW])
+        worst = run
+        for i in range(_CONFIDENCE_WINDOW, n):
+            run += vals[i] - vals[i - _CONFIDENCE_WINDOW]
+            worst = min(worst, run)
+        worst /= _CONFIDENCE_WINDOW
+    return {
+        "mean_logprob": round(sum(vals) / n, 4),
+        "low_conf_frac": round(sum(1 for v in vals if v < _LOG_HALF) / n, 4),
+        "worst_window": round(worst, 4),
+        "tokens": n,
+    }
+
+
+def _merge_confidence(a: Optional[dict], b: Optional[dict]) -> Optional[dict]:
+    """Confidence of a page read in two halves: token-weighted, worst of both."""
+    if not a or not b:
+        return a or b
+    n = a["tokens"] + b["tokens"]
+    return {
+        "mean_logprob": round((a["mean_logprob"] * a["tokens"] + b["mean_logprob"] * b["tokens"]) / n, 4),
+        "low_conf_frac": round((a["low_conf_frac"] * a["tokens"] + b["low_conf_frac"] * b["tokens"]) / n, 4),
+        "worst_window": min(a["worst_window"], b["worst_window"]),
+        "tokens": n,
+    }
 
 
 def _looks_sideways(image: Image.Image) -> bool:
@@ -740,6 +802,7 @@ async def _attempt(
             "hit_length_limit": a["hit_length_limit"] or b["hit_length_limit"],
             "prompt_used": a.get("prompt_used"),
             "source": f"{a.get('source', prompt_key)}+split",
+            "confidence": _merge_confidence(a.get("confidence"), b.get("confidence")),
         }
     else:
         output = await _run_inference(enhanced, prompt_key)
@@ -759,6 +822,7 @@ async def _attempt(
         sparse_page=sparse_page,
         source=output.get("source", prompt_key),
         rotation=rotate,
+        confidence=output.get("confidence"),
     )
     # No image dimensions here: _score_content_density switches to a
     # pixel-ratio scale when given them, which scores a normal page ~0.26
@@ -869,6 +933,7 @@ async def _run_inference_with_retry(
         "source": best.source,
         "rotation": best.rotation,
         "hit_length_limit": best.hit_length_limit,
+        "confidence": best.confidence,
     }
 
     # Post-OCR blank page detection: only flag as blank if the image itself
@@ -980,6 +1045,8 @@ async def lifespan(app: FastAPI):
         logits_processors=logits_processors,
         skip_special_tokens=False,
         include_stop_str_in_output=True,
+        # 0 = only the chosen token's log-probability (see CONFIDENCE_LOGPROBS)
+        logprobs=0 if CONFIDENCE_LOGPROBS else None,
     )
 
     processor = DeepseekOCRProcessor()

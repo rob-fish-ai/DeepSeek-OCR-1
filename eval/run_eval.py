@@ -83,6 +83,7 @@ def run_item(item, args, data_dir, text_dir):
         "hit_limit": body.get("hit_length_limit", (body.get("num_tokens") or 0) >= LENGTH_LIMIT),
         "source": body.get("source"),
         "rotation": body.get("rotation"),
+        "confidence": body.get("confidence"),
         "out_chars": len(text),
     }
     if gt is not None:

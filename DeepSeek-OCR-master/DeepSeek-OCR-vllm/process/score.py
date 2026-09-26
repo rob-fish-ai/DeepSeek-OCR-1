@@ -108,6 +108,8 @@ class OCRResult:
     source: str = "document"
     # Degrees the page was turned (counter-clockwise) before reading; 0 = as received.
     rotation: int = 0
+    # Token-probability summary from the engine (see api_service._confidence).
+    confidence: Optional[dict] = None
 
 
 # ---------------------------------------------------------------------------

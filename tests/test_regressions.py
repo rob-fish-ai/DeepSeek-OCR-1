@@ -342,3 +342,30 @@ def test_table_markup_is_not_mistaken_for_a_loop():
         f"<tr><td>02/{d:02d}/2026</td><td>{d * 3.17:.2f}</td>" + "<td></td>" * 14 + "</tr>" for d in range(1, 27)
     ) + "</table>"
     assert not is_degenerate_output(ledger)
+
+
+# --- confidence signal ---------------------------------------------------------------
+
+def test_confidence_summary():
+    import math
+    from types import SimpleNamespace as NS
+    probs = [0.99] * 100 + [0.2] * 64 + [0.99] * 36            # one weak 64-token stretch
+    ids = list(range(len(probs)))
+    lps = [{i: NS(logprob=math.log(p))} for i, p in zip(ids, probs)]
+    c = api_service._confidence(ids, lps)
+    assert c["tokens"] == 200
+    assert abs(c["low_conf_frac"] - 64 / 200) < 1e-6
+    assert abs(c["worst_window"] - math.log(0.2)) < 1e-3       # the weak stretch, not the average
+    assert c["mean_logprob"] > c["worst_window"]
+    assert api_service._confidence(ids, None) is None          # engine without logprobs
+
+
+def test_confidence_reported_per_request(service):
+    client, install = service
+    install({"document": (GROUNDED_TEXT, 300, "stop")})
+
+    async def go():
+        async with client() as c:
+            return await post(c, page_png(), retry=False)
+    r = asyncio.run(go()).json()
+    assert "confidence" in r            # None with a stub engine that returns no logprobs
