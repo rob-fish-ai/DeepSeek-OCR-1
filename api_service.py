@@ -897,8 +897,11 @@ async def _read_rotations(
     prompt_key: str,
     results: list[OCRResult],
     sparse_page: bool,
+    settle_early: bool = True,
 ) -> list[OCRResult]:
-    """Read the page turned 270 and 90 degrees; both, not the first acceptable.
+    """Read the page turned 270 and 90 degrees, stopping at the first clean,
+    clearly good read unless `settle_early` is off (the confidence rescue, where
+    a green score is exactly what cannot be trusted).
 
     An angle whose read loops first gets free_ocr, then a two-halves read, at
     that angle. The correct angle of a dense page often loops while the wrong
@@ -906,20 +909,22 @@ async def _read_rotations(
     read looped (capped at 0.35) and the upside-down 90-degree read scored 0.59,
     so the wrong angle won. Rescued, the 270-degree read scored 0.85. On 45
     sideways pages, choosing the angle by best score across both reads was
-    right 42 times; stopping at the first acceptable read, 41; by confidence,
-    39-40.
+    right 42 times; stopping at the first acceptable read (0.60), 41; by
+    confidence, 39-40. Stopping only at a clean read of 0.90 or more matched
+    reading both on all 45 and skipped the second read on 33.
     """
     reads = []
     for deg in (270, 90):
         r = await _attempt(image, prompt_key, f"rotate_{deg}", results, sparse_page, rotate=deg)
         results.append(r)
         reads.append(r)
-    # Rescue looping angles only when neither angle already read clearly well.
-    # Rescuing every looping angle tripled the time on sideways pages (the wrong
-    # angle loops too, and its rescue loops again) for at most one more page in
-    # 45; with this bar the angle was right on 44 of 45 and 9 needed a rescue.
-    if any(not _looped(r) and r.score and r.score.composite >= _ANGLE_CLEARLY_READ for r in reads):
-        return reads
+        # A clean read this good settles the angle: no need to read the other
+        # one or rescue anything. Rescuing every looping angle tripled the time
+        # on sideways pages (the wrong angle loops too, and its rescue loops
+        # again) for at most one more page in 45; with this bar the angle was
+        # right on 44 of 45, 9 needed a rescue and 33 needed only one read.
+        if settle_early and not _looped(r) and r.score and r.score.composite >= _ANGLE_CLEARLY_READ:
+            return reads
     for deg, r in ((270, reads[0]), (90, reads[1])):
         if not _looped(r):
             continue
@@ -984,7 +989,7 @@ async def _confidence_rescue(
             and _looks_sideways(image)):
         return best
     logger.info("Weakest stretch %.2f on a page that looks sideways; trying rotations", conf["worst_window"])
-    reads = await _read_rotations(image, prompt_key, results, sparse_page)
+    reads = await _read_rotations(image, prompt_key, results, sparse_page, settle_early=False)
     candidates = [r for r in reads if not _looped(r) and r.confidence]
     if candidates:
         # The angle by score (better at choosing the angle than confidence);

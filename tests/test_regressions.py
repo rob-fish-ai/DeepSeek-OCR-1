@@ -273,7 +273,7 @@ def test_sideways_page_tries_rotation_first(service):
         async with client() as c:
             return await post(c, sideways_png(), retry=True)
     r = asyncio.run(go()).json()
-    assert engine.calls == ["document", "document", "document"]    # upright, then BOTH angles
+    assert engine.calls == ["document", "document"]    # upright, then 270 read cleanly: settled
     assert r["rotation"] == 270 and r["flag"] != "red"
 
 
@@ -330,7 +330,7 @@ def test_degenerate_sideways_page_gets_rotated(service):
         async with client() as c:
             return await post(c, sideways_png(), retry=True)
     r = asyncio.run(go()).json()
-    assert engine.calls == ["document", "document", "document"]
+    assert engine.calls == ["document", "document"]
     assert r["rotation"] == 270 and "8/8/8" not in r["text"]
 
 
@@ -464,8 +464,8 @@ def test_looping_angle_not_rescued_when_other_angle_read_well(service):
     """Rescuing the wrong angle's loop tripled the time on sideways pages. When
     one angle already reads clearly well, the looping one is left alone."""
     client, install = service
-    # calls: 1 upright (loops), 2 at 270 (clean), 3 at 90 (loops)
-    engine = install({"document": lambda n: (PLAIN_TEXT, 240, "stop") if n == 2 else LOOP,
+    # calls: 1 upright (loops), 2 at 270 (loops), 3 at 90 (clean) -- no rescue of 270
+    engine = install({"document": lambda n: (PLAIN_TEXT, 240, "stop") if n == 3 else LOOP,
                       "free_ocr": (PLAIN_TEXT, 240, "stop")})
 
     async def go():
@@ -473,4 +473,20 @@ def test_looping_angle_not_rescued_when_other_angle_read_well(service):
             return await post(c, sideways_png(), retry=True)
     r = asyncio.run(go()).json()
     assert engine.calls == ["document", "document", "document"]
+    assert r["rotation"] == 90
+
+
+def test_clean_first_angle_skips_the_second(service):
+    """A clean, high-scoring 270-degree read settles the angle; reading 90 as
+    well added ~26 s per sideways page and changed the angle on none of 45."""
+    client, install = service
+    # calls: 1 upright (loops), 2 at 270 (clean)
+    engine = install({"document": lambda n: LOOP if n == 1 else (PLAIN_TEXT, 240, "stop"),
+                      "free_ocr": (PLAIN_TEXT, 240, "stop")})
+
+    async def go():
+        async with client() as c:
+            return await post(c, sideways_png(), retry=True)
+    r = asyncio.run(go()).json()
+    assert engine.calls == ["document", "document"]
     assert r["rotation"] == 270
