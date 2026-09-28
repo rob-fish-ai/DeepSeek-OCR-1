@@ -562,3 +562,73 @@ def test_page_nothing_reads_stops_at_the_call_budget(service):
     assert api_service.MAX_MODEL_CALLS_PER_PAGE == 8
     assert len(engine.calls) == 8        # 6 single reads, then one split; no room for another
     assert r["text"] and r["flag"] != "green"
+
+
+# --- sampled feedback: measuring accuracy on pages that look good -------------------
+
+def _feedback_setup(monkeypatch, tmp_path, rate):
+    monkeypatch.setattr(api_service, "FEEDBACK_ENABLED", True)
+    monkeypatch.setattr(api_service, "FEEDBACK_DIR", str(tmp_path))
+    monkeypatch.setattr(api_service, "FEEDBACK_SAMPLE_RATE", rate)
+
+
+def _saved(tmp_path, sub):
+    d = tmp_path / sub
+    return sorted(d.glob("*.json")) if d.is_dir() else []
+
+
+def _post_and_settle(client, png, headers=None, **form):
+    async def go():
+        async with client() as c:
+            r = await c.post("/ocr/image", files={"file": ("page_1.png", png, "image/png")},
+                             data={k: str(v).lower() for k, v in form.items()}, headers=headers or {})
+            await asyncio.sleep(0.3)      # the save runs in a background task
+            return r
+    return asyncio.run(go())
+
+
+def test_good_page_is_sampled_with_every_read(service, monkeypatch, tmp_path):
+    """A green page with an invented table left nothing to check it against:
+    only low-scoring pages were stored. A share of the rest is now kept, with
+    every read of the page, and the response itself is unchanged."""
+    client, install = service
+    _feedback_setup(monkeypatch, tmp_path, 1.0)
+    install({"document": (PLAIN_TEXT, 240, "stop")})
+    r = _post_and_settle(client, page_png(), retry=True).json()
+    assert r["flag"] == "green" and "reads" not in r
+    [entry] = _saved(tmp_path, "sampled")
+    meta = json.loads(entry.read_text())
+    assert meta["sampled"] is True and entry.with_suffix(".png").exists()
+    assert len(meta["reads"]) == 1 and meta["reads"][0]["kept"] and meta["reads"][0]["text"]
+    assert _saved(tmp_path, "pending") == []
+
+
+def test_eval_traffic_is_never_sampled(service, monkeypatch, tmp_path):
+    client, install = service
+    _feedback_setup(monkeypatch, tmp_path, 1.0)
+    install({"document": (PLAIN_TEXT, 240, "stop")})
+    _post_and_settle(client, page_png(), headers={"X-Request-ID": "eval-run-p1"}, retry=True)
+    assert _saved(tmp_path, "sampled") == []
+
+
+def test_low_scoring_page_still_goes_to_pending_with_its_reads(service, monkeypatch, tmp_path):
+    client, install = service
+    _feedback_setup(monkeypatch, tmp_path, 0.0)
+    install({"document": LOOP, "free_ocr": LOOP})
+    _post_and_settle(client, page_png(), retry=True)
+    [entry] = _saved(tmp_path, "pending")
+    meta = json.loads(entry.read_text())
+    assert meta["sampled"] is False and len(meta["reads"]) > 1
+    assert sum(read["kept"] for read in meta["reads"]) == 1
+
+
+def test_pruning_covers_sampled_entries(monkeypatch, tmp_path):
+    monkeypatch.setattr(api_service, "FEEDBACK_DIR", str(tmp_path))
+    monkeypatch.setattr(api_service, "FEEDBACK_MAX_GB", 1500 / 1024 ** 3)   # 1.5 KB
+    for sub, stamp in (("sampled", "20260101_000000"), ("pending", "20260102_000000")):
+        d = tmp_path / sub
+        d.mkdir()
+        (d / f"{stamp}_aaaaaaaaaaaa.json").write_text("x" * 1000)
+    out = api_service._prune_feedback_storage()
+    assert out["pruned"] == 1
+    assert _saved(tmp_path, "sampled") == [] and len(_saved(tmp_path, "pending")) == 1

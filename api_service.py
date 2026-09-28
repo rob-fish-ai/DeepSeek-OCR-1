@@ -8,11 +8,13 @@ are batched on the GPU automatically without semaphore serialization.
 
 import asyncio
 import base64
+import contextvars
 import io
 import json
 import logging
 import math
 import os
+import random
 import re
 import sys
 import time
@@ -173,6 +175,20 @@ FEEDBACK_SCORE_THRESHOLD = float(os.environ.get("FEEDBACK_SCORE_THRESHOLD", "0.7
 # space. Roughly 111 MB/day of growth at peak traffic.
 FEEDBACK_MAX_GB = float(os.environ.get("FEEDBACK_MAX_GB", "20"))
 FEEDBACK_PRUNE_INTERVAL_S = int(os.environ.get("FEEDBACK_PRUNE_INTERVAL_S", str(6 * 3600)))
+# Share of pages scoring at or above FEEDBACK_SCORE_THRESHOLD that are also
+# kept, in feedback/sampled/, so accuracy can be measured on real traffic and
+# not only on the pages that already look bad. A page from a 42-page external
+# PDF scored 0.96 (green) with an invented schedule table; nothing of it was
+# stored. Eval and probe traffic is never sampled. Pruned with pending/ under
+# FEEDBACK_MAX_GB.
+FEEDBACK_SAMPLE_RATE = float(os.environ.get("FEEDBACK_SAMPLE_RATE", "0.10"))
+# When set, every read of every page (text, score, confidence) is written here
+# as <request id>.json, for offline analysis of eval runs. Off by default.
+READS_DUMP_DIR = os.environ.get("READS_DUMP_DIR", "")
+
+# The reads behind the current page's result, for the feedback saver. Kept out
+# of the result dict, which is sent to the caller as-is.
+_page_reads_var: contextvars.ContextVar[Optional[list]] = contextvars.ContextVar("page_reads", default=None)
 
 # ---------------------------------------------------------------------------
 # Prompt templates
@@ -351,8 +367,24 @@ def _skip_page_result(reason: str, flag_detail: str) -> dict:
 
 
 
-def _save_feedback(image: Image.Image, result: dict, filename: str = None):
-    """Save low-scoring OCR results for future fine-tuning.
+def _feedback_kind(result: dict) -> Optional[str]:
+    """"pending" for a low-scoring page, "sampled" for the random share of the
+    rest (never eval or probe traffic), else None."""
+    score = result.get("score", {}).get("composite", 1.0)
+    if score < FEEDBACK_SCORE_THRESHOLD:
+        return "pending"
+    if rl.request_id_var.get().startswith(("eval-", "probe")):
+        return None
+    if random.random() < FEEDBACK_SAMPLE_RATE:
+        return "sampled"
+    return None
+
+
+def _save_feedback(image: Image.Image, result: dict, filename: str = None,
+                   kind: str = "pending", reads: Optional[list] = None):
+    """Save an OCR result with its page image: low-scoring pages to pending/
+    for correction, sampled good-scoring ones to sampled/ for measuring
+    accuracy. `reads` is every read the page got, for comparing them.
 
     Runs off the request path via asyncio.to_thread. All I/O failures
     are swallowed and logged — feedback storage must never break OCR.
@@ -361,14 +393,11 @@ def _save_feedback(image: Image.Image, result: dict, filename: str = None):
         return
 
     score = result.get("score", {}).get("composite", 1.0)
-    if score >= FEEDBACK_SCORE_THRESHOLD:
-        return
-
     try:
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         entry_id = f"{timestamp}_{uuid.uuid4().hex[:12]}"
 
-        pending_dir = os.path.join(FEEDBACK_DIR, "pending")
+        pending_dir = os.path.join(FEEDBACK_DIR, kind)
         os.makedirs(pending_dir, exist_ok=True)
 
         img_path = os.path.join(pending_dir, f"{entry_id}.png")
@@ -395,6 +424,8 @@ def _save_feedback(image: Image.Image, result: dict, filename: str = None):
             "attempts": result.get("attempts", 0),
             "corrected_text": None,
             "status": "pending",
+            "sampled": kind == "sampled",
+            "reads": reads,
         }
         # Write via a temp file + atomic rename.  A plain open("w") leaves a
         # zero-byte file behind if the process is killed mid-write, which is
@@ -407,8 +438,8 @@ def _save_feedback(image: Image.Image, result: dict, filename: str = None):
             os.fsync(f.fileno())
         os.replace(tmp_path, meta_path)
 
-        logger.info("Feedback saved: %s (score=%.3f, engine=%s)",
-                    entry_id, score, result.get("ocr_engine"))
+        logger.info("Feedback saved to %s: %s (score=%.3f, engine=%s)",
+                    kind, entry_id, score, result.get("ocr_engine"))
     except OSError as e:
         logger.warning("Feedback save failed (I/O error): %s", e)
     except Exception as e:
@@ -419,10 +450,11 @@ def _schedule_feedback(image: Image.Image, result: dict, filename: str = None):
     """Fire-and-forget feedback save; runs in a worker thread."""
     if not FEEDBACK_ENABLED:
         return
-    score = result.get("score", {}).get("composite", 1.0)
-    if score >= FEEDBACK_SCORE_THRESHOLD:
+    kind = _feedback_kind(result)
+    if kind is None:
         return
-    asyncio.create_task(asyncio.to_thread(_save_feedback, image, result, filename))
+    asyncio.create_task(asyncio.to_thread(_save_feedback, image, result, filename,
+                                          kind, _page_reads_var.get()))
 
 
 def _mark_needs_external_ocr(result: dict) -> None:
@@ -911,6 +943,33 @@ def _within_budget(results: list[OCRResult]) -> bool:
     return False
 
 
+def _reads_summary(results: list[OCRResult], best: OCRResult) -> list[dict]:
+    """Every read of a page, for feedback entries and READS_DUMP_DIR."""
+    return [{
+        "label": r.preset_name,
+        "source": r.source,
+        "rotation": r.rotation,
+        "kept": r is best,
+        "score": round(r.score.composite, 4) if r.score else None,
+        "hit_length_limit": r.hit_length_limit,
+        "num_tokens": r.num_tokens,
+        "model_calls": r.model_calls,
+        "worst_window": (r.confidence or {}).get("worst_window"),
+        "text": r.clean_text,
+    } for r in results]
+
+
+def _dump_reads(reads: list[dict]) -> None:
+    try:
+        os.makedirs(READS_DUMP_DIR, exist_ok=True)
+        rid = re.sub(r"[^A-Za-z0-9_.-]", "_", rl.request_id_var.get())[:120]
+        path = os.path.join(READS_DUMP_DIR, f"{rid}_{uuid.uuid4().hex[:6]}.json")
+        with open(path, "w") as f:
+            json.dump({"request_id": rl.request_id_var.get(), "reads": reads}, f)
+    except Exception as e:
+        logger.warning("Reads dump failed: %s", e)
+
+
 def _read_well(r: OCRResult) -> bool:
     """Passed the threshold without running out of room or repeating."""
     return not _looped(r) and not needs_retry(r, SCORE_THRESHOLD)
@@ -1118,6 +1177,11 @@ async def _run_inference_with_retry(
     # and that the PDF/batch endpoints compare against the first pass — is
     # computed exactly the way _format_result computes it.
     await asyncio.to_thread(score_result, best)
+
+    reads = _reads_summary(results, best)
+    _page_reads_var.set(reads)
+    if READS_DUMP_DIR:
+        await asyncio.to_thread(_dump_reads, reads)
 
     flag_info = compute_flags(best, SCORE_THRESHOLD)
 
@@ -1990,7 +2054,7 @@ def _collect_pending(limit: int, offset: int) -> dict:
 
 
 def _prune_feedback_storage() -> dict:
-    """Delete the oldest pending entries until storage fits FEEDBACK_MAX_GB.
+    """Delete the oldest pending and sampled entries until storage fits FEEDBACK_MAX_GB.
 
     Entry ids are timestamp-prefixed, so sorting by filename is chronological.
 
@@ -1999,14 +2063,17 @@ def _prune_feedback_storage() -> dict:
     budget, so a verified set larger than the budget stops pruning rather than
     deleting every pending entry in a futile attempt to get under it.
     """
-    pending_dir = os.path.join(FEEDBACK_DIR, "pending")
     verified_dir = os.path.join(FEEDBACK_DIR, "verified")
     budget = FEEDBACK_MAX_GB * (1024 ** 3)
 
     # Group files by entry id so an entry's .json and .png are removed together.
+    # pending/ and sampled/ are pruned together, oldest first.
     entries: dict = {}
     pending_bytes = 0
-    if os.path.isdir(pending_dir):
+    for sub in ("pending", "sampled"):
+        pending_dir = os.path.join(FEEDBACK_DIR, sub)
+        if not os.path.isdir(pending_dir):
+            continue
         with os.scandir(pending_dir) as it:
             for e in it:
                 try:

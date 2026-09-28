@@ -797,12 +797,29 @@ Estimated ~5% of pages saved. Storage: ~210 KB per entry (image + JSON metadata)
 
 Disable with: `FEEDBACK_ENABLED=false`
 
+#### Sampled pages
+
+Pages scoring at or above the threshold are also kept at random
+(`FEEDBACK_SAMPLE_RATE`, default 0.10) in `feedback/sampled/`, marked
+`"sampled": true`. Low-scoring pages only show where the service already knows
+it failed. A page from an external 42-page PDF scored 0.96 (green) with an
+invented schedule table, and nothing of it was stored. Eval and probe traffic
+(`X-Request-ID` starting `eval-` or `probe`) is never sampled.
+
+Every entry, pending or sampled, now carries `reads`: each read the page got,
+with its label, score, length-limit flag, confidence (`worst_window`), whether
+it was kept, and its text. That makes it possible to check a kept read against
+the others. Only the single-image endpoints save feedback.
+
+`READS_DUMP_DIR` (off by default) writes the same `reads` list for every page to
+`<dir>/<request id>_<suffix>.json`, for analysing eval runs.
+
 #### Retention
 
 Feedback storage was previously unbounded and reached 38,963 entries / 12.2 GB
 at roughly 111 MB/day. A background task now enforces a disk budget
 (`FEEDBACK_MAX_GB`, default 20) at startup and every `FEEDBACK_PRUNE_INTERVAL_S`,
-deleting the oldest pending entries until storage fits. Entry ids are
+deleting the oldest pending and sampled entries until storage fits. Entry ids are
 timestamp-prefixed, so ordering by filename is chronological.
 
 `verified/` is never pruned — those entries carry human-corrected text and are
@@ -910,6 +927,10 @@ returned text was cut off by the output budget, so the end of the page is missin
 
 ### Environment Variables
 
+`start.sh` also reads `KEY=value` lines from `OCR_ENV_FILE` (default
+`/workspace/ocr.env`, outside the repo) on every start or restart, so a setting
+can change without restarting the supervisor.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MODEL_PATH` | `/workspace/models/DeepSeek-OCR` | Path to model weights |
@@ -935,7 +956,9 @@ returned text was cut off by the output budget, so the end of the page is missin
 | `FEEDBACK_DIR` | `./feedback` | Feedback storage path |
 | `FEEDBACK_ENABLED` | `true` | Enable feedback storage |
 | `FEEDBACK_SCORE_THRESHOLD` | `0.70` | Save results below this score |
-| `FEEDBACK_MAX_GB` | `20` | Disk budget; oldest pending entries pruned above it |
+| `FEEDBACK_MAX_GB` | `20` | Disk budget; oldest pending and sampled entries pruned above it |
+| `FEEDBACK_SAMPLE_RATE` | `0.10` | Share of good-scoring pages also kept, in `feedback/sampled/` |
+| `READS_DUMP_DIR` | *(unset)* | Write every read of every page here, for eval analysis |
 | `REQUEST_LOG_FILE` | `/workspace/logs/requests.jsonl` | One JSON line per request (see *Request logging*) |
 | `REQUEST_LOG_MAX_MB` / `REQUEST_LOG_BACKUPS` | `50` / `5` | Rotation for the request log |
 | `LOG_FILENAMES` | `false` | Include upload filenames in the request log (they often contain PII) |

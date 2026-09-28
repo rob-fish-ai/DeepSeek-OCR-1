@@ -30,6 +30,14 @@ echo "============================================"
 
 cd "$(dirname "$0")"
 
+# Optional local settings (KEY=value lines), read on every (re)start so a
+# setting can change without restarting the supervisor. Kept outside the repo.
+OCR_ENV_FILE=${OCR_ENV_FILE:-/workspace/ocr.env}
+if [ -f "$OCR_ENV_FILE" ]; then
+    echo "Settings: $OCR_ENV_FILE"
+    set -a; . "$OCR_ENV_FILE"; set +a
+fi
+
 # Use the project virtualenv's interpreter if present. The system python3
 # has none of the dependencies, so a bare "python3 api_service.py" dies on
 # "ModuleNotFoundError: No module named 'fitz'" and the supervisor spins.
