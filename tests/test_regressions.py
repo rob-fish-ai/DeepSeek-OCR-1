@@ -546,3 +546,19 @@ def test_read_that_ran_out_of_room_is_retried(service):
     r = asyncio.run(go()).json()
     assert len(engine.calls) > 1 and "free_ocr" in engine.calls
     assert r["source"] == "free_ocr" and not r["hit_length_limit"]
+
+
+def test_page_nothing_reads_stops_at_the_call_budget(service):
+    """A page nothing reads well used to try every rescue: one took 15 engine
+    calls and 320 s. It now stops once fewer than two calls of the budget
+    remain, and still returns its best read."""
+    client, install = service
+    engine = install({"document": LOOP, "free_ocr": LOOP})
+
+    async def go():
+        async with client() as c:
+            return await post(c, sideways_png(), retry=True)
+    r = asyncio.run(go()).json()
+    assert api_service.MAX_MODEL_CALLS_PER_PAGE == 8
+    assert len(engine.calls) == 8        # 6 single reads, then one split; no room for another
+    assert r["text"] and r["flag"] != "green"

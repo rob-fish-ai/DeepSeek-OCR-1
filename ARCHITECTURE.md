@@ -628,6 +628,16 @@ already failed, and only to order the attempts: on labelled pages it was right
 ID cards, which costs extra attempts, not correctness. Both rotations are tried
 because both occur in production. Disable the ladder with `LOOP_RESCUE=false`.
 
+**Call budget.** One page uses at most 8 engine calls
+(`MAX_MODEL_CALLS_PER_PAGE`) across all its reads and rescues; a split counts
+as two. An attempt starts only while two calls remain, since any attempt can
+take two (a split, or a page read as one picture region and re-read). So once
+one attempt is refused, every later one is too. A split whose halves both need
+the re-read can still take a page to 9. Without the budget, a page nothing reads well tried every rescue: one
+took 15 calls and 320 s, every read running out of room. On 462 eval pages
+(scanned, simulated, hard), the read finally kept never came after call 7, so
+the cap cut only that page, and it kept the same read.
+
 Separately, whenever the model labels an entire page as one picture region and
 emits nothing else — which cleanup then discards, leaving empty text — the page
 is immediately re-read with `free_ocr` (`FALLBACK_FREE_OCR`, default on). It
@@ -917,6 +927,7 @@ returned text was cut off by the output budget, so the end of the page is missin
 | `MAX_RETRIES` | `3` | Attempts per page with contrast presets (the rescue ladder has its own fixed steps) |
 | `FALLBACK_FREE_OCR` | `true` | Re-read a page labelled as one picture with `free_ocr` |
 | `LOOP_RESCUE` | `true` | Rescue ladder for runaway or sideways pages |
+| `MAX_MODEL_CALLS_PER_PAGE` | `8` | Engine calls one page may use across all reads and rescues |
 | `SKIP_LOW_QUALITY_SCANS` | `false` | Restore the old skip of pages with little content |
 | `CONFIDENCE_LOGPROBS` | `true` | Record per-token confidence for every read |
 | `CONFIDENCE_RESCUE` | `true` | Rotate sideways pages whose read is unsure somewhere |

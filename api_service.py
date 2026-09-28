@@ -129,6 +129,15 @@ SKIP_LOW_QUALITY_SCANS = os.environ.get("SKIP_LOW_QUALITY_SCANS", "false").lower
 # a two-halves read, or rotation instead of contrast presets (see _rescue_ladder).
 LOOP_RESCUE = os.environ.get("LOOP_RESCUE", "true").lower() == "true"
 
+# Engine calls one page may use, across all its reads and rescues. A page that
+# nothing reads well used to try everything: one took 15 calls and 320 s, every
+# read running out of room. On 462 eval pages the read finally kept never came
+# after call 7, so 8 cuts only such pages. An attempt starts only while two
+# calls remain -- any attempt can take two (a split, or a page read as one
+# picture region and re-read) -- so once one is refused, all later ones are.
+# A split whose halves both need the re-read can still reach 9.
+MAX_MODEL_CALLS_PER_PAGE = int(os.environ.get("MAX_MODEL_CALLS_PER_PAGE", "8"))
+
 # Ask the engine for the probability of each generated token, and summarise it
 # per read as a confidence signal. Output-only checks cannot see a page the model
 # reads as fluent invented text (a sideways W-9 came back as a plausible W-9 at
@@ -602,6 +611,7 @@ async def _run_inference(image: Image.Image, prompt_key: str = DEFAULT_PROMPT) -
         logger.info("Whole page read as a single picture region; re-reading with free_ocr")
         fallback = await _run_inference(image, "free_ocr")
         fallback["source"] = "free_ocr_fallback"
+        fallback["model_calls"] = 1 + fallback.get("model_calls", 1)
         return fallback
 
     return {
@@ -612,6 +622,7 @@ async def _run_inference(image: Image.Image, prompt_key: str = DEFAULT_PROMPT) -
         "prompt_used": prompt_key,
         "source": prompt_key,
         "confidence": confidence,
+        "model_calls": 1,
     }
 
 
@@ -852,6 +863,7 @@ async def _attempt(
             "prompt_used": a.get("prompt_used"),
             "source": f"{a.get('source', prompt_key)}+split",
             "confidence": _merge_confidence(a.get("confidence"), b.get("confidence")),
+            "model_calls": a.get("model_calls", 1) + b.get("model_calls", 1),
         }
     else:
         output = await _run_inference(enhanced, prompt_key)
@@ -872,6 +884,7 @@ async def _attempt(
         source=output.get("source", prompt_key),
         rotation=rotate,
         confidence=output.get("confidence"),
+        model_calls=output.get("model_calls", 1),
     )
     # No image dimensions here: _score_content_density switches to a
     # pixel-ratio scale when given them, which scores a normal page ~0.26
@@ -886,6 +899,16 @@ async def _attempt(
 
 
 _ANGLE_CLEARLY_READ = 0.90
+
+
+def _within_budget(results: list[OCRResult]) -> bool:
+    """Whether another attempt fits in MAX_MODEL_CALLS_PER_PAGE."""
+    used = sum(r.model_calls for r in results)
+    if used + 2 <= MAX_MODEL_CALLS_PER_PAGE:
+        return True
+    logger.info("Model-call budget spent (%d of %d); keeping the best of %d reads",
+                used, MAX_MODEL_CALLS_PER_PAGE, len(results))
+    return False
 
 
 def _read_well(r: OCRResult) -> bool:
@@ -929,6 +952,8 @@ async def _read_rotations(
     """
     reads = []
     for deg in (270, 90):
+        if not _within_budget(results):
+            return reads
         r = await _attempt(image, prompt_key, f"rotate_{deg}", results, sparse_page, rotate=deg)
         results.append(r)
         reads.append(r)
@@ -947,6 +972,8 @@ async def _read_rotations(
         steps.append((0, "free_ocr", False))
     steps += [(deg, prompt_key, True) for deg in looping]
     for deg, prompt, split in steps:
+        if not _within_budget(results):
+            break
         label = "free_ocr" if not deg else f"rotate_{deg}+{'split' if split else 'free_ocr'}"
         a = await _attempt(image, prompt, label, results, sparse_page, rotate=deg, split=split)
         results.append(a)
@@ -1057,6 +1084,8 @@ async def _run_inference_with_retry(
             if kind == "presets" and (last.score.composite if last.score else 0) < HOPELESS_THRESHOLD:
                 logger.info("Score %.3f < %.2f — skipping remaining retries",
                             last.score.composite if last.score else 0, HOPELESS_THRESHOLD)
+                break
+            if not _within_budget(results):
                 break
             attempt = await _attempt(image, step.get("prompt", prompt_key), step["label"], results, sparse_page,
                                      preset=step.get("preset"), rotate=step.get("rotate", 0),

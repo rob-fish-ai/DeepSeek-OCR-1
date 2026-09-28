@@ -110,6 +110,9 @@ class OCRResult:
     rotation: int = 0
     # Token-probability summary from the engine (see api_service._confidence).
     confidence: Optional[dict] = None
+    # Engine calls this read took: a split reads two halves, and a page read as
+    # one picture region is read again with free_ocr.
+    model_calls: int = 1
 
 
 # ---------------------------------------------------------------------------
