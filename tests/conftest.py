@@ -44,19 +44,26 @@ class Completion:
 
 
 class Output:
-    def __init__(self, text, tokens, finish_reason, weak=None):
+    def __init__(self, text, tokens, finish_reason, weak=None, finished=True):
         self.outputs = [Completion(text, tokens, finish_reason, weak)]
         self.prompt_token_ids = [0] * 913
+        self.finished = finished
 
 
 class ScriptedEngine:
     """Stands in for vLLM. `script` maps a prompt key ("document", "free_ocr",
     ...) to (text, num_tokens, finish_reason[, weak_probability]), or to a
-    callable returning that for successive calls. Every call is recorded."""
+    callable returning that for successive calls. Every call is recorded.
 
-    def __init__(self, script):
+    With stream=True each read arrives the way vLLM delivers it: growing
+    partial outputs every 32 tokens, then the finished one. A read that is
+    aborted stops there, and its request ID is recorded in `aborted`."""
+
+    def __init__(self, script, stream=False):
         self.script = script
+        self.stream = stream
         self.calls = []
+        self.aborted = []
 
     async def generate(self, prompt, sampling_params, request_id):
         key = PROMPT_BY_TEXT.get(prompt["prompt"], "?")
@@ -64,7 +71,19 @@ class ScriptedEngine:
         await asyncio.sleep(0.01)
         spec = self.script[key]
         text, tokens, finish, *weak = spec(len(self.calls)) if callable(spec) else spec
-        yield Output(text, tokens, finish, weak[0] if weak else None)
+        weak = weak[0] if weak else None
+        if self.stream:
+            for n in range(32, tokens, 32):
+                if request_id in self.aborted:
+                    return
+                yield Output(text[:len(text) * n // tokens], n, None, weak, finished=False)
+                await asyncio.sleep(0)
+        if request_id in self.aborted:
+            return
+        yield Output(text, tokens, finish, weak)
+
+    async def abort(self, request_id):
+        self.aborted.append(request_id)
 
 
 @pytest.fixture
@@ -74,8 +93,8 @@ def service(monkeypatch):
                         type("P", (), {"tokenize_with_images": lambda self, **k: [[None] * 7]})())
     monkeypatch.setattr(api_service, "sampling_params", None)
 
-    def install(script):
-        engine = ScriptedEngine(script)
+    def install(script, stream=False):
+        engine = ScriptedEngine(script, stream)
         monkeypatch.setattr(api_service, "engine", engine)
         return engine
 

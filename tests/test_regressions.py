@@ -632,3 +632,118 @@ def test_pruning_covers_sampled_entries(monkeypatch, tmp_path):
     out = api_service._prune_feedback_storage()
     assert out["pruned"] == 1
     assert _saved(tmp_path, "sampled") == [] and len(_saved(tmp_path, "pending")) == 1
+
+
+# --- stopping a looping read early ---------------------------------------------------
+
+# Shapes taken from production loops: numbers change from line to line because
+# the no-repeat processor forbids exact repeats.
+LEDGER_LOOP = "| # | Date | Amount | Memo |\n|---|---|---|---|\n" + "".join(
+    f"| {i} | {i} | 06-{i:02d} | $233.71 | missions donation |\n" for i in range(1, 400))
+ENUMERATION_LOOP = "Attendance\n\n" + "".join(
+    f"{chr(97 + i % 26) * 2}. {i}th\n" for i in range(1, 600))
+GROUNDED_LOOP = "".join(
+    f"<|ref|>text<|/ref|><|det|>[[77, {i}, 110, {i + 15}]]<|/det|>\n970 \n\n" for i in range(300))
+# Real pages that repeat a lot and must not be stopped: a form with 60 numbered
+# blank rows, and a HUD-style table whose runs of empty cells are broken by labels.
+NUMBERED_FORM = "# Household Members\n\n" + "".join(
+    f"| {i} | | | |\n" for i in range(1, 61)) + "\nSignature of Head of Household ____  Date ____\n"
+HUD_FIELDS = ("Unit Number", "Building ID", "Move-in Date", "Head of Household", "Annual Income",
+              "Asset Income", "Tenant Rent", "Utility Allowance", "Gross Rent", "Subsidy Type",
+              "Household Size", "Student Status", "Elderly Status", "Disability Status")
+HUD_TABLE = "<table>" + "".join(
+    f"<tr><td>{i}. {HUD_FIELDS[i % len(HUD_FIELDS)]} {HUD_FIELDS[(i * 5) % len(HUD_FIELDS)]}</td>"
+    + "<td></td>" * 14 + f"<td>${i * 37},00</td></tr>" for i in range(1, 140)) + "</table>"
+
+
+@pytest.mark.parametrize("text", [LEDGER_LOOP, ENUMERATION_LOOP, GROUNDED_LOOP])
+def test_loop_shapes_are_recognised_while_generating(text):
+    from process import is_looping_tail
+    assert is_looping_tail(text)
+
+
+@pytest.mark.parametrize("text", [NUMBERED_FORM, HUD_TABLE, PLAIN_TEXT * 40, GROUNDED_TEXT * 20])
+def test_repetitive_real_pages_are_not_mistaken_for_loops(text):
+    from process import is_looping_tail
+    assert not is_looping_tail(text)
+
+
+def _inferences():
+    return [json.loads(line) for line in open(api_service.REQUEST_LOG_FILE)][-1]["inference"]["detail"]
+
+
+def test_looping_read_is_stopped_and_rescued(service):
+    """A loop used to run to the length limit (40 s quiet, minutes under load)
+    before its retry could start. It is now stopped and aborted in the engine,
+    and the retry ladder treats it as a read that ran out of room."""
+    client, install = service
+    engine = install({"document": (LEDGER_LOOP, 7280, "length"),
+                      "free_ocr": (PLAIN_TEXT, 240, "stop")}, stream=True)
+    r = asyncio.run(_post_once(client, page_png(), retry=True))
+    assert r["flag"] == "green" and r["source"] == "free_ocr"
+    stopped = [d for d in _inferences() if d["stopped_loop"]]
+    assert stopped and all(d["hit_length_limit"] and d["tokens"] < 7280 for d in stopped)
+    assert [d["engine_request_id"] for d in stopped] == engine.aborted
+
+
+def test_stopped_loop_is_flagged_like_one_that_ran_out(service):
+    """When every read loops, the page must come back exactly as before:
+    not green, flagged truncated."""
+    client, install = service
+    install({"document": (LEDGER_LOOP, 7280, "length"), "free_ocr": (LEDGER_LOOP, 7280, "length")},
+            stream=True)
+    r = asyncio.run(_post_once(client, page_png(), retry=True, raw=True))
+    assert r["flag"] != "green" and r["hit_length_limit"]
+    assert "truncated_output" in [d["code"] for d in r["flag_details"]]
+    # It is judged as the loop run on to the limit, but the caller gets only
+    # what the model wrote.
+    assert LEDGER_LOOP.startswith(r["raw_text"]) and r["text"] == r["raw_text"]
+
+
+def test_stopped_loop_text_is_what_the_model_wrote(service):
+    client, install = service
+    install({"document": (LEDGER_LOOP, 7280, "length"), "free_ocr": (LEDGER_LOOP, 7280, "length")},
+            stream=True)
+    r = asyncio.run(_post_once(client, page_png(), retry=True))
+    written = clean_output(LEDGER_LOOP)
+    assert all(line in written for line in r["text"].splitlines())
+
+
+def test_judged_loop_keeps_external_ocr_routing(service):
+    """A loop that ran to the limit asks for external OCR when nearly all of it
+    is garbage. Stopped early it holds little garbage; judged as run on to the
+    limit it must still ask."""
+    client, install = service
+    # The shape of a production loop on a signature page: "24. 24. 24. ..." per line.
+    loop = "".join(f"{i}. {i}. {i}. {i}. {i}. {i}. {i}. {i}.\n" for i in range(1, 1300))
+    for early_stop in (False, True):
+        api_service.LOOP_EARLY_STOP = early_stop
+        install({"document": (loop, 7280, "length"), "free_ocr": (loop, 7280, "length")}, stream=True)
+        r = asyncio.run(_post_once(client, page_png(), retry=False))
+        assert r["needs_external_ocr"], f"early_stop={early_stop}"
+    api_service.LOOP_EARLY_STOP = True
+
+
+def test_repetitive_real_page_reads_to_the_end(service):
+    client, install = service
+    engine = install({"document": (NUMBERED_FORM, 1400, "stop")}, stream=True)
+    r = asyncio.run(_post_once(client, page_png(), retry=True))
+    assert engine.aborted == [] and not r["hit_length_limit"]
+    assert "Signature of Head of Household" in r["text"]
+
+
+def test_early_stop_can_be_switched_off(service, monkeypatch):
+    client, install = service
+    monkeypatch.setattr(api_service, "LOOP_EARLY_STOP", False)
+    engine = install({"document": (LEDGER_LOOP, 7280, "length"),
+                      "free_ocr": (PLAIN_TEXT, 240, "stop")}, stream=True)
+    asyncio.run(_post_once(client, page_png(), retry=True))
+    assert engine.aborted == []
+    assert all(not d["stopped_loop"] for d in _inferences())
+
+
+async def _post_once(client, png, **form):
+    async with client() as c:
+        resp = await post(c, png, **form)
+    assert resp.status_code == 200
+    return resp.json()

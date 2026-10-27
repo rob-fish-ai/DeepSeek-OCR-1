@@ -638,6 +638,31 @@ took 15 calls and 320 s, every read running out of room. On 462 eval pages
 (scanned, simulated, hard), the read finally kept never came after call 7, so
 the cap cut only that page, and it kept the same read.
 
+**Stopping a loop early** (`LOOP_EARLY_STOP`). A looping read used to run on to
+the length limit (~7,280 tokens: 40 s on a quiet engine, minutes under load)
+before any retry could start; in production these reads were 11% of pages and
+66% of engine time. The output is now watched as it streams: from 512 tokens,
+every 32, the last 100 lines (table rows count as lines) are compared once
+numbers, box coordinates and empty cells are ignored, and if they use at most
+3 templates the read is aborted in the engine. Exact repeats are already
+forbidden by the no-repeat processor, so loops repeat a template with changing
+numbers: "aa. 554th", "| 187 | 187 | 06-203 | $233.71 | missions donation |".
+The bar is set by what a page can hold, not by how repetitive real pages get:
+forms carry 40-50 numbered blank rows. Replayed over 1,146 real outputs, it
+stopped 81 of the 122 reads that ran to the limit, saving 40% of their tokens,
+lost 17 genuinely new words in all, and fired on 2 green outputs, both loops
+the scorer had missed.
+
+A stopped read counts as one that ran out of room, so the ladder, caps and
+flags apply unchanged, and it is judged as the loop it was becoming: its last
+100 lines are repeated out to the limit, numbers advancing, and scored as such
+(`loop_run_to_limit`). Judged as stopped it holds little garbage, so 21 of 87
+real loops changed flag and 13 lost `needs_external_ocr`; judged run on, 79
+kept their flag and all 87 kept `needs_external_ocr`. The extension is used
+only for decisions: the response carries the text the model wrote. Leaving
+the stream alone does not stop generation; the read must be aborted in the
+engine, or the loop runs on unseen.
+
 Separately, whenever the model labels an entire page as one picture region and
 emits nothing else — which cleanup then discards, leaving empty text — the page
 is immediately re-read with `free_ocr` (`FALLBACK_FREE_OCR`, default on). It
@@ -949,6 +974,7 @@ can change without restarting the supervisor.
 | `FALLBACK_FREE_OCR` | `true` | Re-read a page labelled as one picture with `free_ocr` |
 | `LOOP_RESCUE` | `true` | Rescue ladder for runaway or sideways pages |
 | `MAX_MODEL_CALLS_PER_PAGE` | `8` | Engine calls one page may use across all reads and rescues |
+| `LOOP_EARLY_STOP` | `true` | Abort a read once its output is a loop, instead of at the length limit |
 | `SKIP_LOW_QUALITY_SCANS` | `false` | Restore the old skip of pages with little content |
 | `CONFIDENCE_LOGPROBS` | `true` | Record per-token confidence for every read |
 | `CONFIDENCE_RESCUE` | `true` | Rotate sideways pages whose read is unsure somewhere |

@@ -113,6 +113,11 @@ class OCRResult:
     # Engine calls this read took: a split reads two halves, and a page read as
     # one picture region is read again with free_ocr.
     model_calls: int = 1
+    # For a read stopped as a loop, raw_text/clean_text hold the loop run on to
+    # the limit (loop_run_to_limit), which is what every decision is made on;
+    # these hold what the model actually wrote, which is what the caller gets.
+    shown_raw: Optional[str] = None
+    shown_clean: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -373,6 +378,77 @@ def is_degenerate_output(text: str) -> bool:
     """
     words = _WORD.findall(re.sub(r"<[^>]+>", " ", text).lower())
     return len(words) >= _DEGENERATE_MIN_WORDS and len(set(words)) / len(words) < _DEGENERATE_DISTINCT_RATIO
+
+
+# A loop caught while it is still generating, so the read can be stopped
+# instead of running on to the length limit (~7,280 tokens: 40 s on a quiet
+# engine, minutes under load). The no-repeat logits processor forbids exact
+# repeats, so loops repeat a template with changing numbers -- "aa. 554th",
+# "| 187 | 187 | 06-203 | $233.71 | missions donation |", "Group 461" -- and
+# numbers are normalised away before comparing lines.
+#
+# The threshold is set by what one page can hold, not by how repetitive real
+# pages get: forms legitimately carry 40-50 numbered blank rows and runs of
+# identical label rows. Replayed over 1,146 real outputs (980 green): 100 lines
+# from at most 3 templates fires on 81 of the 122 reads that ran to the limit,
+# saving 40% of their tokens, and loses 17 genuinely new words in total. It
+# fires on 2 green outputs, both loops the scorer misses ("Insurance:" 60+
+# times; "970" repeated with boxes running past the bottom of the page). At 40
+# lines it fired on 9 green outputs, several of them real forms.
+_LOOP_LINES = 100
+_LOOP_TEMPLATES = 3
+_LOOP_TAIL_CHARS = 20000
+_LOOP_DET = re.compile(r"<\|det\|>.*?<\|/det\|>", re.S)
+_LOOP_EMPTY_CELL = re.compile(r"<td>\s*</td>")
+_LOOP_DIGITS = re.compile(r"\d+")
+_LOOP_ENUMERATOR = re.compile(r"^[a-z]{1,3}[.)]\s", re.M)
+_LOOP_LINE_END = re.compile(r"\n|</tr>")
+_LOOP_SPACE = re.compile(r"\s+")
+_LOOP_FILLER = {"<tr>", "|", "---"}
+
+
+def is_looping_tail(text: str) -> bool:
+    """The end of a still-running generation is a loop: its last 100 lines
+    (table rows count as lines) use at most 3 templates once numbers, box
+    coordinates and empty table cells are ignored."""
+    tail = text[-_LOOP_TAIL_CHARS:]
+    tail = _LOOP_DET.sub("", tail)
+    tail = _LOOP_EMPTY_CELL.sub("", tail)
+    tail = _LOOP_DIGITS.sub("0", tail.lower())
+    tail = _LOOP_ENUMERATOR.sub("a. ", tail)
+    pieces = _LOOP_LINE_END.split(tail)
+    # The last piece is the line still being written, and when the text was
+    # longer than the window the first is a line cut in half: neither is a template.
+    pieces = pieces[1 if len(text) > _LOOP_TAIL_CHARS else 0:-1]
+    lines = [_LOOP_SPACE.sub(" ", p).strip() for p in pieces]
+    lines = [p for p in lines if p and p not in _LOOP_FILLER]
+    if len(lines) < _LOOP_LINES:
+        return False
+    return len(set(lines[-_LOOP_LINES:])) <= _LOOP_TEMPLATES
+
+
+def loop_run_to_limit(text: str, num_tokens: int, limit_tokens: int) -> str:
+    """A read stopped as a loop, as it would have run on to the length limit:
+    its last 100 lines repeated, numbers advancing the way a loop's do.
+
+    Scoring judges a loop by how much of its output is garbage, and a read
+    stopped early holds little. Scored as stopped, 21 of 87 real loops changed
+    flag and 13 lost needs_external_ocr; scored this way 79 kept their flag
+    and all 87 kept needs_external_ocr. Repeated verbatim instead, 72 kept
+    their flag: a copy is more degenerate than a loop that counts. For
+    scoring only -- the caller gets the text the model wrote.
+    """
+    ends = [m.end() for m in _LOOP_LINE_END.finditer(text)]
+    if not ends:
+        return text
+    window = text[ends[-_LOOP_LINES - 1] if len(ends) > _LOOP_LINES else 0:ends[-1]]
+    target = int(len(text) / max(num_tokens, 1) * limit_tokens)
+    parts, length, step = [text[:ends[-1]]], ends[-1], 0
+    while length < target and window:
+        step += 1
+        parts.append(_LOOP_DIGITS.sub(lambda m: str(int(m.group()) + step * 100), window))
+        length += len(parts[-1])
+    return "".join(parts)[:target]
 
 
 def _token_similarity(a: str, b: str) -> float:

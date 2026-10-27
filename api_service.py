@@ -67,7 +67,7 @@ from process import (
 )
 from process.image_process import DeepseekOCRProcessor
 from process.ngram_norepeat import NoRepeatNGramLogitsProcessor
-from process.score import is_degenerate_output
+from process.score import is_degenerate_output, is_looping_tail, loop_run_to_limit
 from vllm import SamplingParams
 from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.engine.arg_utils import AsyncEngineArgs
@@ -130,6 +130,17 @@ SKIP_LOW_QUALITY_SCANS = os.environ.get("SKIP_LOW_QUALITY_SCANS", "false").lower
 # Retry pages whose generation ran away, or that look sideways, with free_ocr,
 # a two-halves read, or rotation instead of contrast presets (see _rescue_ladder).
 LOOP_RESCUE = os.environ.get("LOOP_RESCUE", "true").lower() == "true"
+
+# Stop a read as soon as its output has turned into a loop (is_looping_tail)
+# instead of letting it run on to the length limit. Looping reads were 11% of
+# production pages and 66% of engine time: each ran ~7,280 tokens, 40 s on a
+# quiet engine and several minutes under load, before the retry could start.
+# A stopped read is marked as having run out of room, so the retry ladder, the
+# score caps and the flags treat it exactly as they treat a read that did.
+# The check starts at 512 tokens and runs every 32 tokens.
+LOOP_EARLY_STOP = os.environ.get("LOOP_EARLY_STOP", "true").lower() == "true"
+_LOOP_CHECK_FROM = 512
+_LOOP_CHECK_EVERY = 32
 
 # Engine calls one page may use, across all its reads and rescues. A page that
 # nothing reads well used to try everything: one took 15 calls and 320 s, every
@@ -604,14 +615,30 @@ async def _run_inference(image: Image.Image, prompt_key: str = DEFAULT_PROMPT) -
         request_id=request_id,
     )
 
-    # Collect the final output
+    # Collect the final output, watching for a loop as it streams in
     final_output = None
+    stopped_loop = False
+    next_check = _LOOP_CHECK_FROM
     try:
         async for request_output in results_generator:
             final_output = request_output
+            if LOOP_EARLY_STOP and not request_output.finished:
+                completion = request_output.outputs[0]
+                if len(completion.token_ids) >= next_check:
+                    next_check = len(completion.token_ids) + _LOOP_CHECK_EVERY
+                    if is_looping_tail(completion.text):
+                        stopped_loop = True
+                        break
     except Exception as e:
         logger.error("Inference failed for request %s: %s", request_id, e, exc_info=True)
         raise HTTPException(500, f"Inference error: {e}")
+    if stopped_loop:
+        # Leaving the stream does not stop generation: vLLM aborts a request only
+        # when told to, so without this the loop runs on to the limit unseen.
+        await engine.abort(request_id)
+        await results_generator.aclose()
+        logger.info("Read %s stopped at %d tokens: the output is looping",
+                    request_id, len(final_output.outputs[0].token_ids))
 
     if final_output is None:
         raise HTTPException(500, "Inference returned no output")
@@ -621,7 +648,8 @@ async def _run_inference(image: Image.Image, prompt_key: str = DEFAULT_PROMPT) -
     num_tokens = len(completion.token_ids)
     confidence = _confidence(completion.token_ids, getattr(completion, "logprobs", None))
     prompt_tokens = len(final_output.prompt_token_ids or [])
-    hit_length_limit = getattr(completion, "finish_reason", None) == "length"
+    # A read stopped as a loop counts as one that ran out of room: it would have.
+    hit_length_limit = getattr(completion, "finish_reason", None) == "length" or stopped_loop
 
     ctx = rl.request_ctx_var.get()
     if ctx is not None:
@@ -631,6 +659,7 @@ async def _run_inference(image: Image.Image, prompt_key: str = DEFAULT_PROMPT) -
             "prompt_tokens": prompt_tokens,
             "tokens": num_tokens,
             "hit_length_limit": hit_length_limit,
+            "stopped_loop": stopped_loop,
             "ms": round((time.monotonic() - started) * 1000),
             "confidence": confidence,
         })
@@ -646,7 +675,7 @@ async def _run_inference(image: Image.Image, prompt_key: str = DEFAULT_PROMPT) -
         fallback["model_calls"] = 1 + fallback.get("model_calls", 1)
         return fallback
 
-    return {
+    output = {
         "text": text,
         "num_tokens": num_tokens,
         "prompt_tokens": prompt_tokens,
@@ -656,11 +685,17 @@ async def _run_inference(image: Image.Image, prompt_key: str = DEFAULT_PROMPT) -
         "confidence": confidence,
         "model_calls": 1,
     }
+    if stopped_loop:
+        output["judged_text"] = loop_run_to_limit(text, num_tokens, MAX_MODEL_LEN - prompt_tokens)
+    return output
 
 
 async def _format_result(inference_output: dict, raw: bool, image: Image.Image = None) -> dict:
     """Build a consistent result dict from inference output."""
-    text = inference_output["text"]
+    # Decisions are made on the judged text (a stopped loop run on to the
+    # limit); the caller gets what the model wrote.
+    shown = inference_output["text"]
+    text = inference_output.get("judged_text", shown)
     num_tokens = inference_output["num_tokens"]
     stats = CleanStats()
     # Post-processing and scoring are CPU work over output that can be tens of
@@ -685,9 +720,10 @@ async def _format_result(inference_output: dict, raw: bool, image: Image.Image =
     score = await asyncio.to_thread(score_result, ocr_result)
     flag_info = compute_flags(ocr_result, SCORE_THRESHOLD)
 
+    shown_clean = cleaned if text is shown else await asyncio.to_thread(clean_output, shown, None, ref_is_content)
     result = {
-        "text": text if raw else cleaned,
-        "raw_text": text,
+        "text": shown if raw else shown_clean,
+        "raw_text": shown,
         "num_tokens": num_tokens,
         "score": score.to_dict(),
         "flag": flag_info["flag"],
@@ -897,14 +933,17 @@ async def _attempt(
             "confidence": _merge_confidence(a.get("confidence"), b.get("confidence")),
             "model_calls": a.get("model_calls", 1) + b.get("model_calls", 1),
         }
+        if "judged_text" in a or "judged_text" in b:
+            output["judged_text"] = a.get("judged_text", a["text"]) + "\n\n" + b.get("judged_text", b["text"])
     else:
         output = await _run_inference(enhanced, prompt_key)
 
     stats = CleanStats()
     ref_is_content = output.get("prompt_used") == "ocr"
-    cleaned = await asyncio.to_thread(clean_output, output["text"], stats, ref_is_content)
+    judged = output.get("judged_text", output["text"])
+    cleaned = await asyncio.to_thread(clean_output, judged, stats, ref_is_content)
     result = OCRResult(
-        raw_text=output["text"],
+        raw_text=judged,
         clean_text=cleaned,
         num_tokens=output["num_tokens"],
         max_tokens=MAX_TOKENS,
@@ -918,6 +957,9 @@ async def _attempt(
         confidence=output.get("confidence"),
         model_calls=output.get("model_calls", 1),
     )
+    if "judged_text" in output:
+        result.shown_raw = output["text"]
+        result.shown_clean = await asyncio.to_thread(clean_output, output["text"], None, ref_is_content)
     # No image dimensions here: _score_content_density switches to a
     # pixel-ratio scale when given them, which scores a normal page ~0.26
     # instead of ~1.0.  _format_result scores without dimensions, and the
@@ -955,7 +997,7 @@ def _reads_summary(results: list[OCRResult], best: OCRResult) -> list[dict]:
         "num_tokens": r.num_tokens,
         "model_calls": r.model_calls,
         "worst_window": (r.confidence or {}).get("worst_window"),
-        "text": r.clean_text,
+        "text": r.clean_text if r.shown_clean is None else r.shown_clean,
     } for r in results]
 
 
@@ -1186,8 +1228,8 @@ async def _run_inference_with_retry(
     flag_info = compute_flags(best, SCORE_THRESHOLD)
 
     result = {
-        "text": best.clean_text,
-        "raw_text": best.raw_text,
+        "text": best.clean_text if best.shown_clean is None else best.shown_clean,
+        "raw_text": best.raw_text if best.shown_raw is None else best.shown_raw,
         "num_tokens": best.num_tokens,
         "score": best.score.to_dict() if best.score else None,
         "flag": flag_info["flag"],
